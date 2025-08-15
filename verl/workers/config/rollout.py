@@ -117,6 +117,7 @@ class RolloutConfig(BaseConfig):
     ignore_eos: bool = False
     enforce_eager: bool = True
     cudagraph_capture_sizes: Optional[list] = None
+    disable_cudagraph: bool = False
     free_cache_engine: bool = True
     data_parallel_size: int = 1
     expert_parallel_size: int = 1
@@ -177,6 +178,9 @@ class RolloutConfig(BaseConfig):
     limit_images: Optional[int] = None
 
     skip_tokenizer_init: bool = False
+
+    quantization: Optional[str] = None
+    quantization_config_file: Optional[str] = None
 
     def __post_init__(self):
         """Validate the rollout config"""
