@@ -38,7 +38,6 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     assert_pkg_version,
-    get_ip,
     get_open_port,
     is_cuda,
     set_prometheus_multiproc_dir,
@@ -82,6 +81,11 @@ try:
 except ImportError:
     from sglang.srt.openai_api.protocol import Tool
 
+# compatible with sglang 0.5.3
+try:
+    from sglang.srt.utils import get_ip
+except ImportError:
+    from sglang.srt.utils import get_local_ip_auto as get_ip
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -868,7 +872,7 @@ class SGLangRollout(BaseRollout):
                     _req.add_tool_response_messages(self.processing_class, [resp for resp, _, _ in tool_call_results])
                     for tool_call, (resp, reward, metrics) in zip(parsed_tool_calls, tool_call_results, strict=True):
                         _req.update_metrics(metrics, tool_call.function.name)
-                    if len(_req.input_ids) >= self.config.max_model_len:
+                    if _req.input_ids.size(-1) >= self.config.max_model_len:
                         finish_reason_type = FinishReasonTypeEnum.STOP
                         break
                     _req.state = AsyncRolloutRequestStateEnum.RUNNING
@@ -1006,7 +1010,7 @@ class SGLangRollout(BaseRollout):
                     break
                 else:
                     _req.add_user_message(self.processing_class, content)
-                    if len(_req.input_ids) >= self.config.max_model_len:
+                    if _req.input_ids.size(-1) >= self.config.max_model_len:
                         finish_reason_type = FinishReasonTypeEnum.STOP
                         break
                     else:
