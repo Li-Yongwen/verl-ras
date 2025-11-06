@@ -216,18 +216,24 @@ class vLLMRollout(BaseRollout):
         compilation_config = {}
 
         cudagraph_capture_sizes = config.get("cudagraph_capture_sizes")
+        disable_cudagraph = config.get("disable_cudagraph", False)
         # enforce_eager must be False to use cudagraph
-        if not config.enforce_eager and cudagraph_capture_sizes:
-            if isinstance(cudagraph_capture_sizes, ListConfig):
-                compilation_args = {"cudagraph_capture_sizes": cudagraph_capture_sizes}
-                if _use_compilation_mode:
-                    compilation_args["mode"] = CompilationMode.VLLM_COMPILE
-                else:
-                    compilation_args["level"] = CompilationLevel.PIECEWISE
-                compilation_config["compilation_config"] = CompilationConfig(**compilation_args)
+        if not config.enforce_eager:
+            compilation_args = {}
+            if _use_compilation_mode:
+                compilation_args["mode"] = CompilationMode.VLLM_COMPILE
+                if disable_cudagraph:
+                    compilation_args["cudagraph_mode"] = "NONE"
             else:
-                logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
+                compilation_args["level"] = CompilationLevel.PIECEWISE
+            if cudagraph_capture_sizes:
+                if isinstance(cudagraph_capture_sizes, ListConfig):
+                    compilation_args = {"cudagraph_capture_sizes": cudagraph_capture_sizes}
+                else:
+                    logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
+            compilation_config["compilation_config"] = CompilationConfig(**compilation_args)
 
+        hf_overrides = {"quantization_config_file": config.quantization_config_file} if (config.quantization is not None and config.quantization_config_file is not None) else None
         self.inference_engine = LLM(
             model=model_path,
             enable_sleep_mode=config.free_cache_engine,
@@ -247,6 +253,8 @@ class vLLMRollout(BaseRollout):
             enable_prefix_caching=config.enable_prefix_caching,
             trust_remote_code=trust_remote_code,
             seed=config.get("seed", 0),
+            quantization=config.quantization if config.quantization is not None else None,
+            hf_overrides=hf_overrides,
             **compilation_config,
             **self.lora_kwargs,
             **engine_kwargs,
@@ -490,8 +498,7 @@ class vLLMRollout(BaseRollout):
             logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
         else:
             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
-
-            model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
+            model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.get_model()
             patch_vllm_moe_model_weight_loader(model)
             model.load_weights(weights)
 
