@@ -316,9 +316,9 @@ class RayDAPOTrainer(RayPPOTrainer):
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
 
-                    # Compute rollout IS weights and mismatch metrics (inherited from RayPPOTrainer)
-                    batch, is_metrics = self.compute_rollout_importance_weights_and_add_to_batch(batch)
-                    # IS and mismatch metrics already have mismatch/ prefix
+                    # Compute rollout correction weights and off-policy metrics (inherited from RayPPOTrainer)
+                    batch, is_metrics = self.compute_rollout_correction_and_add_to_batch(batch)
+                    # IS and off-policy metrics already have rollout_corr/ prefix
                     metrics.update(is_metrics)
 
                     with marked_timer("adv", timing_raw, "brown"):
