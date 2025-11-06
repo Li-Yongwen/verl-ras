@@ -1,14 +1,45 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-NUM_GPUS=${NUM_GPUS:-8}
+MODEL_ID=Qwen3-30B-A3B-Instruct #!
+MODEL_PATH=/mnt/hpfs_test/weights/Qwen3-30B-A3B-Instruct
+DUMMY_MODEL_PATH=/mnt/hpfs_test/weights/Qwen3-30B-A3B-Instruct-dummy
+USE_DIST_CKPT=True
+USE_DUMMY_MODEL=True
+DUMMY_MODEL_CONFIG_PATH=tests/special_e2e/ppo_trainer/expert_parallel/qwen3moe_minimal.json
+
+#############################################
+
+NUM_GPUS=${NUM_GPUS:-16}
 
 MODEL_ID=${MODEL_ID:-Qwen/Qwen3-30B-Instruct}
 MODEL_PATH=${MODEL_PATH:-${HOME}/models/${MODEL_ID}}
-huggingface-cli download "${MODEL_ID}" --local-dir "${MODEL_PATH}"
-
 USE_DIST_CKPT=${USE_DIST_CKPT:-False}
 DIST_CKPT_PATH=${DIST_CKPT_PATH:-${HOME}/dist_ckpt/qwen3_30b_dapo_mindspeed}
+
+if [ "$USE_DUMMY_MODEL" = "True" ]; then
+    DUMMY_MODEL_PATH=${DUMMY_MODEL_PATH:-${HOME}/models_dummy/${MODEL_ID}}
+    if [ -z "${DUMMY_MODEL_CONFIG_PATH}"  ]; then
+        echo "[ERROR] DUMMY_MODEL_CONFIG_PATH not set"
+        exit 1
+    fi
+    python scripts/init_random_model.py \
+        --hf_model_path "${MODEL_PATH}" \
+        --new_config_path "${DUMMY_MODEL_CONFIG_PATH}" \
+        --output_path "${DUMMY_MODEL_PATH}"
+    MODEL_PATH=$DUMMY_MODEL_PATH
+fi
+
+if [ "$USE_DIST_CKPT" = "True" ]; then
+    torchrun --nproc_per_node 2 --nnodes 1 scripts/converter_hf_to_mcore.py \
+        --hf_model_path "${MODEL_PATH}" \
+        --output_path "${DIST_CKPT_PATH}"
+fi
+
+exit 0
+
+
+
 if [[ ${USE_DIST_CKPT} == "True" ]]; then
     if [[ ${USE_DUMMY_MODEL} == "True" ]]; then
         DIST_CKPT_PATH=${HOME}/dist_ckpt_dummy/${MODEL_ID}
