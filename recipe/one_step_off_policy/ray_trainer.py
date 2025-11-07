@@ -396,6 +396,84 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                 combined_extras_dict[key] = [d[key] for d in extras_list if key in d]
 
         return combined_reward_tensor, combined_extras_dict
+    
+    def _recover_actor_ref_wg(self):
+        print("[INFO] Recreating actor and reference policy worker groups")
+
+        # release the placement groups and actor_wg
+        try:
+            if hasattr(self, "actor_wg") and self.actor_wg is not None:
+                try:
+                    actor_resource_pool = self.resource_pool_manager.get_resource_pool(Role.Actor)
+                    actor_resource_pool.release_placement_groups()
+                except Exception as e:
+                    print(f"Error releasing actor placement group: {e}")
+                
+                del self.actor_wg
+                print("[INFO] Old actor wg terminated")
+        except Exception as e:
+            print(f"[WARN] Failed to cleanup old actor worker: {e}")
+        
+
+        # release the ref_wg
+        try:
+            if hasattr(self, "ref_policy_wg") and self.ref_policy_wg is not None:
+                del self.ref_policy_wg
+                print("[INFO] Old ref wg terminated")
+        except Exception as e:
+            print(f"[WARN] Failed to cleanup old ref worker: {e}")
+        
+        # get resource pool
+        resource_pool = self.resource_pool_manager.get_resource_pool(Role.Actor)
+
+        # create new actor/ref RayClassWithInitArgs
+        actor_cls = RayClassWithInitArgs(
+            cls = self.role_worker_mapping[Role.Actor],
+            config = self.config.actor_rollout_ref,
+            role=str(Role.Actor),
+        )
+
+        ref_cls = RayClassWithInitArgs(
+            cls = self.role_worker_mapping[Role.RefPolicy],
+            config = self.config.actor_rollout_ref,
+            role=str(Role.RefPolicy),
+        )
+
+        class_dict = {
+            str(Role.Actor): actor_cls,
+            str(Role.RefPolicy): ref_cls,
+        }
+        
+        # update resource pool to cls dict
+        if resource_pool not in self.resource_pool_to_cls:
+            self.resource_pool_to_cls[resource_pool] = {}
+        self.resource_pool_to_cls[resource_pool].update(class_dict)
+
+        # create worker dict cls and wg
+        worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
+        wg_dict = self.ray_worker_group_cls(
+            resource_pool=resource_pool,
+            ray_cls_with_init=worker_dict_cls,
+            device_name=self.device_name,
+        )
+        spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
+        self.actor_wg = spawn_wg[str(Role.Actor)]
+        self.ref_policy_wg = spawn_wg[str(Role.RefPolicy)]
+
+        # initialize models
+        print("initializing actor models")
+        self.actor_wg.init_model()
+        print("actor models initialized")
+        print("initializing ref policy models")
+        self.ref_policy_wg.init_model()
+        print("ref policy models initialized")
+
+        weights_info = self.rollout_wg.get_actor_weights_info()[0]
+        self.actor_wg.set_actor_weights_info(weights_info)
+        
+        self.create_weight_sync_group()
+        
+        print("[INFO] Actor and reference policy worker groups recovered")
 
     def fit(self):
         """
