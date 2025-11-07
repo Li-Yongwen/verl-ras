@@ -60,6 +60,7 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
+from ray.util.queue import queue
 
 
 @dataclass
@@ -1012,6 +1013,21 @@ class RayPPOTrainer:
 
         # Return unchanged batch and empty metrics if IS is disabled
         return batch, {}
+
+    @ray.remote(num_cpus=1)
+    def catch_rollout_tokens(self):
+        while True:
+            token_per_req = self.tokens_queue.get()
+            # pprint(f"[token_per_req]: {token_per_req}")
+            self.requests_tokens.append(token_per_req)
+
+    @ray.remote(num_cpus=1)
+    def catch_rollout_reqs(self):
+        while True:
+            # breakpoint()
+            req = self.requests_queue.get()
+            pprint(f"[bing][debug][catch_rollout_reqs:req]: {req}")
+            self.requests_.append(req)
 
     def fit(self):
         """
