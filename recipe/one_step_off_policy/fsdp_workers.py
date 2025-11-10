@@ -36,6 +36,7 @@ from verl.utils.fs import copy_to_local
 from verl.utils.fsdp_utils import (
     fsdp_version,
 )
+from verl.utils.raise_utils import check_raise
 from verl.utils.import_utils import import_external_libs
 from verl.utils.model import get_generation_config, update_model_config
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, simple_timer
@@ -275,6 +276,7 @@ class RolloutWorker(ActorRolloutRefWorker):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"), blocking=False)
     def async_generate_sequences(self, prompts):
+        check_raise()
         # Support all hardwares
         prompts = prompts.to(get_device_id())
 

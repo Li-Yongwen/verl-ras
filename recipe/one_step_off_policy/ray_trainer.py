@@ -46,7 +46,6 @@ from verl.trainer.ppo.ray_trainer import (
     compute_advantage,
     compute_response_mask,
 )
-from verl.utils.raise_utils import check_raise
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.trainer.ppo.utils import Role, WorkerType, need_reference_policy, need_reward_model
 from verl.utils.debug import marked_timer
@@ -410,7 +409,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         rollout_cls = RayClassWithInitArgs(
             cls=self.role_worker_mapping[Role.Rollout],
             config=self.config.actor_rollout_ref,
-            role="rollout",
+            role=str(Role.Rollout),
         )
 
         class_dict = {
@@ -514,12 +513,18 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                 # wait for the previous batch
                 with marked_timer("wait_prev_gen", timing_raw, color="red"):
                     try:
-                        check_raise()
                         epoch, batch, gen_batch_output, future_reward = batch_data_future.get()
-                    except:
-                        self._recover_rollout_wg()
-                        batch_data_future = self._async_gen_next_batch(continuous_iterator)
-                        epoch, batch, gen_batch_output, future_reward = batch_data_future.get()
+                    except Exception:
+                        while True:
+                            try:
+                                self._recover_rollout_wg()
+                                batch_data_future = self._async_gen_next_batch(continuous_iterator)
+                                epoch, batch, gen_batch_output, future_reward = batch_data_future.get()
+                            except Exception as e:
+                                import traceback
+                                print(f"[RAS] rebuild failed:{e} \n {traceback.format_exc()}")
+                            else:
+                                break
 
                     timing_raw.update(gen_batch_output.meta_info["timing"])
                     gen_batch_output.meta_info.pop("timing", None)
