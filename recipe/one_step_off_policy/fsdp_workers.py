@@ -148,6 +148,11 @@ class ActorRolloutRefWorker(ARRWorker):
         self._weights_info = ret
         return ret
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def set_actor_weights_info(self, weights_info):
+        assert self._is_actor
+        self._weights_info = weights_info
+
 
 class RolloutWorker(ActorRolloutRefWorker):
     def __init__(self, config: DictConfig, role: str):
@@ -323,6 +328,26 @@ class RolloutWorker(ActorRolloutRefWorker):
     def set_actor_weights_info(self, weights_info):
         assert self._is_rollout
         self._weights_info = weights_info
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_actor_weights_info(self):
+        assert self._is_rollout
+        if hasattr(self, "_weights_info"):
+            return self._weights_info
+        if fsdp_version(self.actor_module_fsdp) == 1:
+            from torch.distributed.fsdp.api import ShardedStateDictConfig, StateDictType
+
+            FSDP.set_state_dict_type(
+                self.actor_module_fsdp,
+                state_dict_type=StateDictType.SHARDED_STATE_DICT,
+                state_dict_config=ShardedStateDictConfig(),
+            )
+        params = self._get_actor_params()
+        ret = []
+        for key, tensor in params.items():
+            ret.append((key, tensor.size(), tensor.dtype))
+        self._weights_info = ret
+        return ret
 
 
 class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
