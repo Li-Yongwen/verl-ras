@@ -397,6 +397,83 @@ class OneStepOffRayTrainer(RayPPOTrainer):
 
         return combined_reward_tensor, combined_extras_dict
 
+    def _recover_rollout_wg(self):
+        """ 同时重建 rollout worker group: 1. 销毁旧的 rollout_wg 2. 使用 create_colocated_worker_cls 创建新的 WorkerDict 3. spawn 出新的 Ray actor 进程 4. 初始化模型 """
+
+        print("[INFO] Recreating rollout worker groups...")
+
+        # 销毁旧 rollout_wg
+        try:
+            if hasattr(self, "rollout_wg") and self.rollout_wg is not None:
+                print("[INFO] Stopping old actor worker group...")
+                # 释放pg
+                try:
+                    rollout_resource_pool = self.resource_pool_manager.get_resource_pool(Role.Rollout)
+                    rollout_resource_pool.release_placement_groups()
+                except Exception as e:
+                    print(f"[WARN] Failed to release actor resource pool: {e}")
+
+                del self.rollout_wg
+                print("[INFO] Old actor worker group terminated.")
+        except Exception as e:
+            print(f"[WARN] Failed to cleanup old actor worker: {e}")
+
+        # === 2. 获取资源池 ===
+        resource_pool = self.resource_pool_manager.get_resource_pool(Role.Rollout)
+
+        # 调试打印 PG
+        if not resource_pool.pgs:
+            print("[INFO] No placement groups found.")
+        else:
+            for pg in resource_pool.pgs:
+                print(f"[INFO] Using placement group {pg.id}.")
+
+        # === 3. 构建 actor/ref 的 RayClassWithInitArgs ===
+        rollout_cls = RayClassWithInitArgs(
+            cls=self.role_worker_mapping[Role.Rollout],
+            config=self.config.actor_rollout_ref,
+            role="rollout",
+        )
+
+        class_dict = {
+            "rollout": rollout_cls,
+        }
+
+        # === 4. 更新 resource_pool_to_cls 映射 ===
+        if resource_pool not in self.resource_pool_to_cls:
+            self.resource_pool_to_cls[resource_pool] = {}
+        self.resource_pool_to_cls[resource_pool].update(class_dict)
+
+        # === 5. 创建 colocated WorkerDict ===
+        colocated_worker_cls = create_colocated_worker_cls(class_dict)
+        wg_dict = self.ray_worker_group_cls(
+            resource_pool=resource_pool,
+            ray_cls_with_init=colocated_worker_cls,
+            device_name=self.device_name,
+        )
+
+        # === 6. spawn 出新的 worker ===
+        print("[INFO] Spawning new rollout worker group...")
+        spawned_wgs = wg_dict.spawn(prefix_set=class_dict.keys())
+
+        self.rollout_wg = spawned_wgs["rollout"]
+
+        # === 7. 初始化模型 ===
+        for name, wg in spawned_wgs.items():
+            print(f"[INFO] Initializing {name} model...")
+            try:
+                wg.init_model()
+                print(f"[INFO] {name} model initialized successfully.")
+            except Exception as e:
+                print(f"[WARN] {name} model initialization failed: {e}")
+
+        weights_info = self.actor_wg.get_actor_weights_info()[0]
+        self.rollout_wg.set_actor_weights_info(weights_info)
+
+        self.create_weight_sync_group()
+        print("[INFO] rollout worker groups recreated successfully.")
+
+
     def fit(self):
         """
         The training loop of PPO.
