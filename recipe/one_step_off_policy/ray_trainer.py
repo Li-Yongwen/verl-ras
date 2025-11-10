@@ -451,6 +451,49 @@ class OneStepOffRayTrainer(RayPPOTrainer):
 
         print("[INFO] Actor and reference policy worker groups recovered")
 
+    def _recover_rollout_wg(self):
+        rollout_resource_pool = self.resource_pool_manager.get_resource_pool(Role.Rollout)
+        rollout_resource_pool.release_placement_groups()
+        del self.rollout_wg
+
+        # get resource pool
+        resource_pool = self.resource_pool_manager.get_resource_pool(Role.Rollout)
+
+        # create new rollout RayClassWithInitArgs
+        rollout_cls = RayClassWithInitArgs(
+            cls=self.role_worker_mapping[Role.Rollout],
+            config=self.config.actor_rollout_ref,
+            role=str(Role.Rollout),
+        )
+
+        class_dict = {
+            str(Role.Rollout): rollout_cls,
+        }
+
+        # update resource pool to cls dict
+        if resource_pool not in self.resource_pool_to_cls:
+            self.resource_pool_to_cls[resource_pool] = {}
+        self.resource_pool_to_cls[resource_pool].update(class_dict)
+
+        # create worker dict cls and wg
+        worker_dict_cls = create_colocated_worker_cls(class_dict)
+        wg_dict = self.ray_worker_group_cls(
+            resource_pool=resource_pool,
+            ray_cls_with_init=worker_dict_cls,
+            device_name=self.device_name,
+        )
+
+        spawned_wgs = wg_dict.spawn(prefix_set=class_dict.keys())
+        self.rollout_wg = spawned_wgs[str(Role.Rollout)]
+
+        wg.init_model()
+
+        weights_info = self.actor_wg.get_actor_weights_info()[0]
+        self.rollout_wg.set_actor_weights_info(weights_info)
+
+        self.create_weight_sync_group()
+        print("[INFO] rollout worker groups recovered")
+
     def fit(self):
         """
         The training loop of PPO.
@@ -522,7 +565,18 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             with marked_timer("step", timing_raw):
                 # wait for the previous batch
                 with marked_timer("wait_prev_gen", timing_raw, color="red"):
-                    epoch, batch, gen_batch_output, future_reward = batch_data_future.get()
+                    try:
+                        epoch, batch, gen_batch_output, future_reward = batch_data_future.get()
+                    except Exception:
+                        while True:
+                            try:
+                                self._recover_rollout_wg()
+                                batch_data_future = self._async_gen_next_batch(continuous_iterator)
+                                epoch, batch, gen_batch_output, future_reward = batch_data_future.get()
+                            except Exception as e:
+                                pprint(f"[RAS] rebuild failed:{e} \n {traceback.format_exc()}")
+                            else:
+                                break
                     timing_raw.update(gen_batch_output.meta_info["timing"])
                     gen_batch_output.meta_info.pop("timing", None)
 
