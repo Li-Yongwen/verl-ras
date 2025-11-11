@@ -25,7 +25,8 @@ from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pprint import pprint
-from typing import Optional
+from typing import List, Optional
+import time
 
 import numpy as np
 import ray
@@ -60,7 +61,8 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
-from ray.util.queue import queue
+from verl.utils.model import compute_position_id_with_mask
+from ray.util.queue import Queue
 
 
 @dataclass
@@ -344,6 +346,27 @@ class RayPPOTrainer:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+        self.tokens_queue= Queue()
+        self.requests_queue= Queue()        
+        self.index_prompt_tokens= defaultdict() # 临时存储
+                                
+        self._index_prompt_tokens_status = Queue() 
+        #通过_set_tokens_queue_readable_status和_get_tokens_queue_readable_status获取index_prompt_tokens_queue的可读状态
+        self._index_prompt_tokens_status.put(1)
+        self.index_prompt_tokens_queue = Queue()
+
+    def _set_tokens_queue_readable_status(self, readable: bool):
+        len_queue = self._index_prompt_tokens_status.size()
+        for _ in range(len_queue):
+            self._index_prompt_tokens_status.get()
+        if readable:    
+            self._index_prompt_tokens_status.put(1)
+        else:
+            return
+
+    def _get_tokens_queue_readable_status(self):
+        return self._index_prompt_tokens_status.size()==1
+
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -511,17 +534,26 @@ class RayPPOTrainer:
         # Log to each configured logger
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
-    def _get_gen_batch(self, batch: DataProto) -> DataProto:
-        reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
-
+    def _get_gen_batch(
+        self,
+        batch: DataProto,
+        input_batch_keys_to_pop: List[str] = [
+            "input_ids",
+            "attention_mask",
+            "position_ids",
+        ],
+    ) -> DataProto:
+        reward_model_keys = (
+            set({"data_source", "reward_model", "extra_info"})
+            & batch.non_tensor_batch.keys()
+        )
         # pop those keys for generation
-        batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+        batch_keys_to_pop = input_batch_keys_to_pop        
         non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_model_keys
         gen_batch = batch.pop(
             batch_keys=batch_keys_to_pop,
             non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
         )
-
         # For agent loop, we need reward model keys to compute score.
         if self.async_rollout_mode:
             gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
@@ -764,7 +796,7 @@ class RayPPOTrainer:
 
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
         self.actor_rollout_wg = all_wg[str(Role.ActorRollout)]
-        self.actor_rollout_wg.init_model()
+        self.actor_rollout_wg.init_model(self.tokens_queue, self.requests_queue)
 
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
@@ -1013,6 +1045,46 @@ class RayPPOTrainer:
 
         # Return unchanged batch and empty metrics if IS is disabled
         return batch, {}
+    def _parse_req_tokens(self, token_per_req: dict) -> dict:
+        """
+        从新的 step_result 数据结构中提取 tokens 信息。       
+        Args:
+            token_per_req: step_result 字典，包含：
+                - finished_req_ids: 已完成的请求 ID 列表(全局id)
+                - req_info: 字典，key 为 global_req_id，value 包含：
+                    - req_id: vLLM 的 req_id
+                    - sampled_token_ids: 采样的 token IDs
+                    - req_id_to_index: vLLM 内部的索引      
+        Returns:
+            字典，格式为 {global_req_id: {"raw_prompt_ids": [...], "new_token_ids": [...]}}
+        """
+        while not self._get_tokens_queue_readable_status():
+            time.sleep(1)
+        self._set_tokens_queue_readable_status(readable=False)
+        if self.index_prompt_tokens_queue.size()==0:
+            self.index_prompt_tokens = {}
+        else:
+            self.index_prompt_tokens=self.index_prompt_tokens_queue.get()
+        req_info = token_per_req.get("req_info", {})
+        finished_global_ids=token_per_req.get("finished_global_ids",{})
+        for global_req_id, req_info in req_info.items():
+            sampled_token_ids = req_info.get("sampled_token_ids", [])
+            if hasattr(sampled_token_ids, 'tolist'):
+                new_token_ids = sampled_token_ids.tolist()
+            elif isinstance(sampled_token_ids, (list, tuple)):
+                new_token_ids = list(sampled_token_ids)
+            else:
+                new_token_ids = [sampled_token_ids] if sampled_token_ids is not None else []
+            self.index_prompt_tokens.setdefault(global_req_id, {
+                "raw_prompt_ids": [], 
+                "new_token_ids": []
+            })
+            self.index_prompt_tokens[global_req_id]["new_token_ids"].extend(new_token_ids)
+        for finished_global_id in finished_global_ids:
+            self.index_prompt_tokens.pop(finished_global_id)
+        self.index_prompt_tokens_queue.put(self.index_prompt_tokens)
+        self._set_tokens_queue_readable_status(readable=True)
+
 
     @ray.remote(num_cpus=1)
     def catch_rollout_tokens(self):
@@ -1021,13 +1093,6 @@ class RayPPOTrainer:
             # pprint(f"[token_per_req]: {token_per_req}")
             self.requests_tokens.append(token_per_req)
 
-    @ray.remote(num_cpus=1)
-    def catch_rollout_reqs(self):
-        while True:
-            # breakpoint()
-            req = self.requests_queue.get()
-            pprint(f"[bing][debug][catch_rollout_reqs:req]: {req}")
-            self.requests_.append(req)
 
     def fit(self):
         """
@@ -1036,6 +1101,8 @@ class RayPPOTrainer:
         to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
+        self.catch_rollout_tokens.remote(self)
+
         from omegaconf import OmegaConf
 
         from verl.utils.tracking import Tracking
@@ -1104,9 +1171,27 @@ class RayPPOTrainer:
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
+                gen_batch.meta_info[per_request_generated_tokens]= per_request_generated_tokens
                 gen_batch_output = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
+                gen_batch_output.non_tensor_batch["global_id"] = np.array(
+                    [str("bing"+str(i)) for i in range(len(gen_batch_output.batch))], dtype=object
+                )
+                while not self._get_tokens_queue_readable_status():
+                    time.sleep(0.5)
+                self._set_tokens_queue_readable_status(readable=False)
+                prompts = gen_batch_output.non_tensor_batch["raw_prompt_ids"]
+                global_ids=gen_batch_output.non_tensor_batch["global_id"]
+                if self.index_prompt_tokens_queue.size()==0:
+                    self.index_prompt_tokens={}
+                else:
+                    self.index_prompt_tokens=self.index_prompt_tokens_queue.get()
+                for i, global_id in enumerate(global_ids):
+                    self.index_prompt_tokens.setdefault(global_id, {"raw_prompt_ids": [], "new_token_ids": []})
+                    self.index_prompt_tokens[global_id]["raw_prompt_ids"] = prompts[i]
+                self.index_prompt_tokens_queue.put(self.index_prompt_tokens)
+                self._set_tokens_queue_readable_status(readable=True)
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
@@ -1114,6 +1199,74 @@ class RayPPOTrainer:
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
+                            breakpoint()
+                            def update_gen_batch_output_with_new_tokens(
+                                self,
+                                gen_batch_output: DataProto,
+                            ) -> DataProto:
+                                tmp=self.index_prompt_tokens_queue.get()
+                                all_tokens=tmp # XXX是Queue(self.tokens...)的值
+                                batch_size = gen_batch_output.batch.batch_size[0] # 128
+                                gen_batch_output.batch.batch_size[0]
+                                all_raw_prompt_ids = [
+                                    all_tokens[key].get('raw_prompt_ids', []) 
+                                    for key in all_tokens
+                                ]
+                                all_new_token_ids = [
+                                    all_tokens[key].get('new_token_ids', []) 
+                                    for key in all_tokens
+                                ]
+
+                                per_request_generated_tokens = [0] * batch_size
+                                for idx, gen_token_num in enumerate(all_new_token_ids):
+                                    if gen_token_num != []:
+                                        per_request_generated_tokens[idx] = len(gen_token_num)
+                                gen_batch_output.non_tensor_batch["per_request_generated_tokens"] = (
+                                    per_request_generated_tokens
+                                ) # 128长度
+                            
+                                # 构建新的 prompts: raw_prompt_ids + new_token_ids
+                                new_prompts = [all_raw_prompt_ids[i] + all_new_token_ids[i] for i in range(batch_size)]
+                                new_prompt_lengths = [len(p) for p in new_prompts]
+                                max_prompt_len = max(new_prompt_lengths) if new_prompt_lengths else 0                                
+
+                                # 获取设备信息（从 gen_batch_output.batch 的任意 tensor 字段获取，优先使用 input_ids）
+                                if 'input_ids' in gen_batch_output.batch:
+                                    ref_tensor = gen_batch_output.batch['input_ids']
+                                elif 'responses' in gen_batch_output.batch:
+                                    ref_tensor = gen_batch_output.batch['responses']
+                                else:
+                                    # 如果都不存在，创建一个临时 tensor 来推断设备（使用 CPU 作为默认值）
+                                    ref_tensor = torch.tensor([0])
+                                device = ref_tensor.device
+                                dtype = ref_tensor.dtype                                                              
+                                # Padding prompts 并转换为 tensor（padded_prompts 已经包含了所有内容：原始 prompt + 新生成的 tokens）
+                                # 获取 pad_token_id（优先从 gen_batch_output.meta_info 获取，否则从 tokenizer 获取）
+                                pad_token_id = gen_batch_output.meta_info.get("pad_token_id")
+                                if pad_token_id is None:
+                                    pad_token_id = self.tokenizer.pad_token_id
+                                if pad_token_id is None:
+                                    # 如果 pad_token_id 仍然为 None，使用 eos_token_id（vLLM 的默认行为）
+                                    pad_token_id = self.tokenizer.eos_token_id if hasattr(self.tokenizer, 'eos_token_id') else 0
+                                padded_prompts = [
+                                    p + [pad_token_id] * (max_prompt_len - len(p)) if len(p) < max_prompt_len else p
+                                    for p in new_prompts
+                                ]
+                                prompts_tensor = torch.tensor(padded_prompts, dtype=dtype, device=device)
+                                # input_ids 就是 padded_prompts（已经包含了所有内容，不需要再拼接 responses）
+                                input_ids = prompts_tensor
+                                # 构建 attention_mask: 基于 padded_prompts 的实际长度（有效部分为1，padding部分为0）
+                                attention_mask = torch.zeros((batch_size, max_prompt_len), dtype=torch.long, device=device)
+                                for i, prompt_len in enumerate(new_prompt_lengths):
+                                    attention_mask[i, :prompt_len] = 1  # 有效部分设为1
+                                # 计算 position_ids: 基于 attention_mask
+                                position_ids = compute_position_id_with_mask(attention_mask)
+                                # 更新 gen_batch_output.batch
+                                gen_batch_output.batch['prompts'] = prompts_tensor
+                                gen_batch_output.batch['input_ids'] = input_ids
+                                gen_batch_output.batch['attention_mask'] = attention_mask
+                                gen_batch_output.batch['position_ids'] = position_ids                                
+                        
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
 

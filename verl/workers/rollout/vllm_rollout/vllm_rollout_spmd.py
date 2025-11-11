@@ -130,7 +130,6 @@ class vLLMRollout(BaseRollout):
         device_mesh: DeviceMesh,
     ):
         super().__init__(config, model_config, device_mesh)
-
         if config.layered_summon:
             self.sleep_level = 1
         else:
@@ -377,12 +376,39 @@ class vLLMRollout(BaseRollout):
                 lora_requests = [
                     LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="/simon-stub-path")
                 ] * batch_size
+        # Handle per-request max_tokens for resume requests
+        per_request_generated_tokens = prompts.non_tensor_batch.get("per_request_generated_tokens", [0] * len(prompts))
+        per_request_max_tokens = [
+            self.sampling_params.max_tokens - generated_tokens
+            for generated_tokens in per_request_generated_tokens
+        ]
+        if not all(token == 0 for token in per_request_generated_tokens):
+            print("[bing-debug] token continuation.....")
+            # Create sampling_params_list with different max_tokens for each request
+            sampling_params_list = [
+                SamplingParams(
+                    max_tokens=max_tokens,
+                    n=self.sampling_params.n,
+                    logprobs=self.sampling_params.logprobs,
+                    temperature=self.sampling_params.temperature,
+                    top_p=self.sampling_params.top_p,
+                    top_k=self.sampling_params.top_k,
+                    repetition_penalty=self.sampling_params.repetition_penalty,
+                    detokenize=self.sampling_params.detokenize,
+                )
+                for max_tokens in per_request_max_tokens
+            ]
+            sampling_params_to_use = sampling_params_list
+            print(f"Using per-request max_tokens: {per_request_max_tokens}")
+        else:
+            print("[bing-debug] no token continuation.....")
+            sampling_params_to_use = self.sampling_params
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
             outputs = self.inference_engine.generate(
                 prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
+                sampling_params=sampling_params_to_use,
                 lora_request=lora_requests,
                 use_tqdm=False,
             )
