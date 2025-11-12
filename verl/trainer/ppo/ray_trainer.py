@@ -1047,14 +1047,14 @@ class RayPPOTrainer:
         return batch, {}
     def _parse_req_tokens(self, token_per_req: dict) -> dict:
         """
-        从新的 step_result 数据结构中提取 tokens 信息。       
+        从新的 step_result 数据结构中提取 tokens 信息。
         Args:
             token_per_req: step_result 字典，包含：
                 - finished_req_ids: 已完成的请求 ID 列表(全局id)
                 - req_info: 字典，key 为 global_req_id，value 包含：
                     - req_id: vLLM 的 req_id
                     - sampled_token_ids: 采样的 token IDs
-                    - req_id_to_index: vLLM 内部的索引      
+                    - req_id_to_index: vLLM 内部的索引
         Returns:
             字典，格式为 {global_req_id: {"raw_prompt_ids": [...], "new_token_ids": [...]}}
         """
@@ -1076,7 +1076,7 @@ class RayPPOTrainer:
             else:
                 new_token_ids = [sampled_token_ids] if sampled_token_ids is not None else []
             self.index_prompt_tokens.setdefault(global_req_id, {
-                "raw_prompt_ids": [], 
+                "raw_prompt_ids": [],
                 "new_token_ids": []
             })
             self.index_prompt_tokens[global_req_id]["new_token_ids"].extend(new_token_ids)
@@ -1091,7 +1091,7 @@ class RayPPOTrainer:
         while True:
             token_per_req = self.tokens_queue.get()
             self._parse_req_tokens(token_per_req)
-            
+
 
     def _recover_actor_rollout_ref_wg(self):
         print("[INFO] Recreating actor rollout and reference policy worker groups")
@@ -1270,23 +1270,23 @@ class RayPPOTrainer:
                 gen_batch.meta_info["global_steps"] = self.global_steps
                 gen_batch_output = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
-                )                
+                )
                 gen_batch_output_tmp = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
                 gen_batch_output_ori = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
-                                                
+
                 gen_batch_output.non_tensor_batch["global_id"] = np.array(
                     [str("bing"+str(i)) for i in range(len(gen_batch_output.batch))], dtype=object
                 )
-                
+
                 gen_batch_output_tmp.non_tensor_batch["global_id"] = np.array(
                     [str("bing"+str(i)) for i in range(len(gen_batch_output.batch))], dtype=object
-                )                
+                )
                 gen_batch_output_ori.non_tensor_batch["global_id"] = np.array(
-                    [str("bing"+str(i)) for i in range(len(gen_batch_output.batch))], dtype=object                
+                    [str("bing"+str(i)) for i in range(len(gen_batch_output.batch))], dtype=object
                     )
                 while not self._get_tokens_queue_readable_status():
                     time.sleep(0.5)
@@ -1308,8 +1308,6 @@ class RayPPOTrainer:
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
-                            breakpoint()
                             def _update_gen_batch_with_partial_tokens(
                                 gen_batch_output_tmp: DataProto,
                             ) -> DataProto:
@@ -1427,10 +1425,9 @@ class RayPPOTrainer:
                                     new_prompts, dtype=object)
                                 return gen_batch_output_tmp
 
+                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
                             _update_gen_batch_with_partial_tokens(gen_batch_output_tmp)
                             gen_batch_output_tmp = self.actor_rollout_wg.generate_sequences(gen_batch_output_tmp)
-                            breakpoint()
-
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
 
