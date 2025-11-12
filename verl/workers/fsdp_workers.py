@@ -622,7 +622,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 4. build rollout model
         log_gpu_memory_usage(f"Before building {self.config.rollout.name} rollout", logger=logger)
-
+        self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
+            config=rollout_config,
+            model_config=model_config,
+            device_mesh=rollout_device_mesh
+        )
+        
         def patch_step(self_):
             if not self_.scheduler.has_requests():
                 return {}, False
@@ -630,11 +635,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             model_output = self_.execute_model_with_error_logging(
                 self_.model_executor.execute_model, scheduler_output  # type: ignore
             )
-            try:
-                if torch.distributed.get_rank() == 4:
-                    raise Exception("raise in the second vllm instance")
-            except Exception as e:
-                print(f"exception:{e}")
+            # try:
+            #     if torch.distributed.get_rank() == 4:
+            #         raise Exception("raise in the second vllm instance")
+            # except Exception as e:
+            #     print(f"exception:{e}")
             engine_core_outputs = self_.scheduler.update_from_output(
                 scheduler_output, model_output
             )  # type: ignore
@@ -675,7 +680,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     "finished_global_ids": finished_global_ids,  # 已完成的请求的 global_id 列表
                     "req_info": req_info
                 }
-                tokens_queue.put(step_result)
+                if tokens_queue is not None:
+                    tokens_queue.put(step_result)
             return (
                 engine_core_outputs,
                 scheduler_output.total_num_scheduled_tokens > 0,

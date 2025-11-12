@@ -383,7 +383,8 @@ class vLLMRollout(BaseRollout):
             for generated_tokens in per_request_generated_tokens
         ]
         if not all(token == 0 for token in per_request_generated_tokens):
-            print("[bing-debug] token continuation.....")
+            print("[debug] token continuation.....")
+            print(f"per_request_max_tokens={per_request_max_tokens}")
             # Create sampling_params_list with different max_tokens for each request
             sampling_params_list = [
                 SamplingParams(
@@ -401,7 +402,7 @@ class vLLMRollout(BaseRollout):
             sampling_params_to_use = sampling_params_list
             print(f"Using per-request max_tokens: {per_request_max_tokens}")
         else:
-            print("[bing-debug] no token continuation.....")
+            print("[debug] no token continuation.....")
             sampling_params_to_use = self.sampling_params
 
         # users can customize different sampling_params at different run

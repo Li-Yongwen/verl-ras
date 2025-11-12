@@ -349,7 +349,7 @@ class RayPPOTrainer:
         self.tokens_queue= Queue()
         self.requests_queue= Queue()        
         self.index_prompt_tokens= defaultdict() # 临时存储
-                                
+        self.requests_tokens = []
         self._index_prompt_tokens_status = Queue() 
         #通过_set_tokens_queue_readable_status和_get_tokens_queue_readable_status获取index_prompt_tokens_queue的可读状态
         self._index_prompt_tokens_status.put(1)
@@ -1090,9 +1090,8 @@ class RayPPOTrainer:
     def catch_rollout_tokens(self):
         while True:
             token_per_req = self.tokens_queue.get()
-            # pprint(f"[token_per_req]: {token_per_req}")
-            self.requests_tokens.append(token_per_req)
-
+            self._parse_req_tokens(token_per_req)
+            
 
     def fit(self):
         """
@@ -1174,10 +1173,24 @@ class RayPPOTrainer:
                 gen_batch.meta_info[per_request_generated_tokens]= per_request_generated_tokens
                 gen_batch_output = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                )                
+                gen_batch_output_tmp = gen_batch.repeat(
+                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
+                gen_batch_output_ori = gen_batch.repeat(
+                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                )
+                                                
                 gen_batch_output.non_tensor_batch["global_id"] = np.array(
                     [str("bing"+str(i)) for i in range(len(gen_batch_output.batch))], dtype=object
                 )
+                
+                gen_batch_output_tmp.non_tensor_batch["global_id"] = np.array(
+                    [str("bing"+str(i)) for i in range(len(gen_batch_output.batch))], dtype=object
+                )                
+                gen_batch_output_ori.non_tensor_batch["global_id"] = np.array(
+                    [str("bing"+str(i)) for i in range(len(gen_batch_output.batch))], dtype=object                
+                    )
                 while not self._get_tokens_queue_readable_status():
                     time.sleep(0.5)
                 self._set_tokens_queue_readable_status(readable=False)
@@ -1200,73 +1213,127 @@ class RayPPOTrainer:
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
                             breakpoint()
-                            def update_gen_batch_output_with_new_tokens(
-                                self,
-                                gen_batch_output: DataProto,
+                            def _update_gen_batch_with_partial_tokens(
+                                gen_batch_output_tmp: DataProto,
                             ) -> DataProto:
-                                tmp=self.index_prompt_tokens_queue.get()
-                                all_tokens=tmp # XXX是Queue(self.tokens...)的值
-                                batch_size = gen_batch_output.batch.batch_size[0] # 128
-                                gen_batch_output.batch.batch_size[0]
-                                all_raw_prompt_ids = [
-                                    all_tokens[key].get('raw_prompt_ids', []) 
-                                    for key in all_tokens
-                                ]
-                                all_new_token_ids = [
-                                    all_tokens[key].get('new_token_ids', []) 
-                                    for key in all_tokens
-                                ]
-
+                                # 1. 从队列中获取第一轮推理的输出 tokens
+                                if self.index_prompt_tokens_queue.size()==1:
+                                    tmp = self.index_prompt_tokens_queue.get()
+                                    all_tokens = tmp  # 格式: {global_id: {"raw_prompt_ids": [...], "new_token_ids": [...]}}
+                                    self.index_prompt_tokens_queue.put(tmp)
+                                else:
+                                    print("error")
+                                # 2. 确保使用 gen_batch_output_tmp 的原始数据（未进入第一次 generate_sequences）
+                                # gen_batch_output_tmp 已经在第一次调用前创建，包含原始数据
+                                batch_size = gen_batch_output_tmp.batch.batch_size[0]
+                                # 3. 按照 gen_batch_output_tmp 的 global_id 顺序获取 tokens，确保顺序一致
+                                global_ids = gen_batch_output_tmp.non_tensor_batch["global_id"]
+                                all_raw_prompt_ids = []
+                                all_new_token_ids = []
+                                for global_id in global_ids:
+                                    token_info = all_tokens.get(global_id, {"raw_prompt_ids": [], "new_token_ids": []})
+                                    all_raw_prompt_ids.append(token_info.get('raw_prompt_ids', []))
+                                    all_new_token_ids.append(token_info.get('new_token_ids', []))
+                                # 4. 计算每请求生成的 tokens 数量
                                 per_request_generated_tokens = [0] * batch_size
                                 for idx, gen_token_num in enumerate(all_new_token_ids):
                                     if gen_token_num != []:
                                         per_request_generated_tokens[idx] = len(gen_token_num)
-                                gen_batch_output.non_tensor_batch["per_request_generated_tokens"] = (
+                                gen_batch_output_tmp.non_tensor_batch["per_request_generated_tokens"] = np.array(
                                     per_request_generated_tokens
-                                ) # 128长度
-                            
-                                # 构建新的 prompts: raw_prompt_ids + new_token_ids
+                                )
+                                # 5. 构建新的 prompts: raw_prompt_ids + new_token_ids（第一轮生成的 tokens）
+                                # 拼接后得到新的 prompt（未 padding）
                                 new_prompts = [all_raw_prompt_ids[i] + all_new_token_ids[i] for i in range(batch_size)]
                                 new_prompt_lengths = [len(p) for p in new_prompts]
-                                max_prompt_len = max(new_prompt_lengths) if new_prompt_lengths else 0                                
-
-                                # 获取设备信息（从 gen_batch_output.batch 的任意 tensor 字段获取，优先使用 input_ids）
-                                if 'input_ids' in gen_batch_output.batch:
-                                    ref_tensor = gen_batch_output.batch['input_ids']
-                                elif 'responses' in gen_batch_output.batch:
-                                    ref_tensor = gen_batch_output.batch['responses']
+                                max_prompt_len = max(new_prompt_lengths) if new_prompt_lengths else 0
+                                # 6. 获取目标 padding 长度
+                                # 注意：作为第二次 generate_sequences 的输入，prompts 和 input_ids 应该只包含 prompt 部分
+                                # 应该使用第一次输出的 prompts 长度（prompt_length），而不是 input_ids 长度（prompt_length + response_length）
+                                target_prompt_len = None
+                                if 'input_ids' in gen_batch_output_tmp.batch:
+                                    # 使用第一次输出的 prompts 长度（这是 prompt 部分的长度，已经 left-padded）
+                                    target_prompt_len = gen_batch_output_tmp.batch['input_ids'].shape[-1]
+                                if target_prompt_len is None:
+                                    target_prompt_len = max_prompt_len
+                                # 确保 target_prompt_len 至少等于 max_prompt_len（不能小于实际内容长度）
+                                target_prompt_len = max(target_prompt_len, max_prompt_len)
+                                # 7. 获取设备信息（优先从 gen_batch_output 获取，因为它们在同一个设备上）
+                                device = None
+                                dtype = None
+                                if 'input_ids' in gen_batch_output_tmp.batch:
+                                    ref_tensor = gen_batch_output_tmp.batch['input_ids']
+                                    device = ref_tensor.device
+                                    dtype = ref_tensor.dtype
+                                elif 'prompts' in gen_batch_output_tmp.batch:
+                                    ref_tensor = gen_batch_output_tmp.batch['prompts']
+                                    device = ref_tensor.device
+                                    dtype = ref_tensor.dtype
+                                elif 'responses' in gen_batch_output_tmp.batch:
+                                    ref_tensor = gen_batch_output_tmp.batch['responses']
+                                    device = ref_tensor.device
+                                    dtype = ref_tensor.dtype
                                 else:
-                                    # 如果都不存在，创建一个临时 tensor 来推断设备（使用 CPU 作为默认值）
-                                    ref_tensor = torch.tensor([0])
-                                device = ref_tensor.device
-                                dtype = ref_tensor.dtype                                                              
-                                # Padding prompts 并转换为 tensor（padded_prompts 已经包含了所有内容：原始 prompt + 新生成的 tokens）
-                                # 获取 pad_token_id（优先从 gen_batch_output.meta_info 获取，否则从 tokenizer 获取）
-                                pad_token_id = gen_batch_output.meta_info.get("pad_token_id")
+                                    device = torch.device('cpu')
+                                    dtype = torch.long
+                                # 8. 获取 pad_token_id（优先从 gen_batch_output_tmp.meta_info 获取）
+                                pad_token_id = gen_batch_output_tmp.meta_info.get("pad_token_id")
                                 if pad_token_id is None:
                                     pad_token_id = self.tokenizer.pad_token_id
                                 if pad_token_id is None:
                                     # 如果 pad_token_id 仍然为 None，使用 eos_token_id（vLLM 的默认行为）
                                     pad_token_id = self.tokenizer.eos_token_id if hasattr(self.tokenizer, 'eos_token_id') else 0
-                                padded_prompts = [
-                                    p + [pad_token_id] * (max_prompt_len - len(p)) if len(p) < max_prompt_len else p
-                                    for p in new_prompts
-                                ]
-                                prompts_tensor = torch.tensor(padded_prompts, dtype=dtype, device=device)
-                                # input_ids 就是 padded_prompts（已经包含了所有内容，不需要再拼接 responses）
-                                input_ids = prompts_tensor
-                                # 构建 attention_mask: 基于 padded_prompts 的实际长度（有效部分为1，padding部分为0）
-                                attention_mask = torch.zeros((batch_size, max_prompt_len), dtype=torch.long, device=device)
+                                # 9. Padding prompts 并转换为 tensor（使用 left pad，与原始 gen_batch 保持一致）
+                                # 参考 postprocess_data 的实现，使用 left pad（padding 在左侧，有效内容在右侧）
+                                # 使用 target_prompt_len 作为 padding 长度，确保与第一次输入的 prompt 部分长度一致
+                                unpadded_prompts_list = []
+                                for prompt in new_prompts:
+                                    if len(prompt) > 0:
+                                        prompt_tensor = torch.tensor(prompt, dtype=dtype, device=device)
+                                        # 如果长度小于 target_prompt_len，需要 pad 到 target_prompt_len
+                                        if len(prompt) < target_prompt_len:
+                                            # 使用 left pad：在左侧添加 padding
+                                            pad_length = target_prompt_len - len(prompt)
+                                            padded = torch.cat([
+                                                torch.full((pad_length,), pad_token_id, dtype=dtype, device=device),
+                                                prompt_tensor
+                                            ])
+                                            unpadded_prompts_list.append(padded)
+                                        else:
+                                            # 如果长度大于 target_prompt_len，截断到 target_prompt_len
+                                            unpadded_prompts_list.append(prompt_tensor[:target_prompt_len])
+                                    else:
+                                        # 空序列，全部 padding
+                                        unpadded_prompts_list.append(
+                                            torch.full((target_prompt_len,), pad_token_id, dtype=dtype, device=device)
+                                        )
+                                # 堆叠成 batch tensor
+                                prompts_tensor = torch.stack(unpadded_prompts_list, dim=0)
+                                # 10. 更新 gen_batch_output_tmp 的必要参数
+                                # input_ids 就是 padded_prompts（已经包含了原始 prompt + 第一轮生成的 tokens）
+                                gen_batch_output_tmp.batch['input_ids'] = prompts_tensor
+                                # 11. 构建 attention_mask: 基于实际长度（有效部分为1，padding部分为0）
+                                # 使用 left pad，所以有效部分在右侧
+                                # 使用 target_prompt_len 作为长度，确保与第一次输入的 prompt 部分长度一致
+                                attention_mask = torch.zeros((batch_size, target_prompt_len), dtype=torch.long, device=device)
                                 for i, prompt_len in enumerate(new_prompt_lengths):
-                                    attention_mask[i, :prompt_len] = 1  # 有效部分设为1
-                                # 计算 position_ids: 基于 attention_mask
+                                    # 有效部分在右侧（left pad），但不超过 target_prompt_len
+                                    actual_len = min(prompt_len, target_prompt_len)
+                                    attention_mask[i, -actual_len:] = 1  # 有效部分在右侧（left pad）
+                                gen_batch_output_tmp.batch['attention_mask'] = attention_mask
+                                # 12. 计算 position_ids: 基于 attention_mask（与原始 gen_batch 保持一致）
                                 position_ids = compute_position_id_with_mask(attention_mask)
-                                # 更新 gen_batch_output.batch
-                                gen_batch_output.batch['prompts'] = prompts_tensor
-                                gen_batch_output.batch['input_ids'] = input_ids
-                                gen_batch_output.batch['attention_mask'] = attention_mask
-                                gen_batch_output.batch['position_ids'] = position_ids                                
-                        
+                                gen_batch_output_tmp.batch['position_ids'] = position_ids
+
+                                # 13. 更新 raw_prompt_ids（用于后续处理）
+                                gen_batch_output_tmp.non_tensor_batch["raw_prompt_ids"] = np.array(
+                                    new_prompts, dtype=object)
+                                return gen_batch_output_tmp
+
+                            _update_gen_batch_with_partial_tokens(gen_batch_output_tmp)
+                            gen_batch_output_tmp = self.actor_rollout_wg.generate_sequences(gen_batch_output_tmp)
+                            breakpoint()
+
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
 
