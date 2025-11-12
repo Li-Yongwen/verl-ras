@@ -138,6 +138,20 @@ class RayResourcePool(ResourcePool):
         self.pgs = pgs
         return pgs
 
+    def release_placement_groups(self):
+        "Release all placement groups in the resource pool"
+        if self.pgs is None:
+            print("No placement groups to release")
+            return
+
+        for pg in self.pgs:
+            try:
+                ray.util.remove_placement_group(pg)
+            except Exception as e:
+                print(f"Error releasing placement group {pg}: {e}")
+
+        self.pgs = None
+        print("Placement groups released")
 
 def extract_pg_from_exist(
     resource_pools: dict[str, RayResourcePool], src_role_names: list[str], resource_pool: RayResourcePool

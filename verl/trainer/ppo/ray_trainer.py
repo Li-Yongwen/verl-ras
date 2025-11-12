@@ -1093,6 +1093,104 @@ class RayPPOTrainer:
             self._parse_req_tokens(token_per_req)
             
 
+    def _recover_actor_rollout_ref_wg(self):
+        print("[INFO] Recreating actor rollout and reference policy worker groups")
+
+        # release the placement groups and actor_rollout_wg
+        try:
+            if hasattr(self, "actor_rollout_wg") and self.actor_rollout_wg is not None:
+                try:
+                    actor_rollout_resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+                    actor_rollout_resource_pool.release_placement_groups()
+                except Exception as e:
+                    print(f"Error releasing actor rollout placement group: {e}")
+
+                del self.actor_rollout_wg
+                print("[INFO] Old actor rollout wg terminated")
+        except Exception as e:
+            print(f"[WARN] Failed to cleanup old actor rollout worker: {e}")
+
+
+        # release the ref_wg
+        try:
+            if hasattr(self, "ref_policy_wg") and self.ref_policy_wg is not None:
+                del self.ref_policy_wg
+                print("[INFO] Old ref wg terminated")
+        except Exception as e:
+            print(f"[WARN] Failed to cleanup old ref worker: {e}")
+
+        # get resource pool
+        resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+
+        # create new actor/ref RayClassWithInitArgs
+        actor_rollout_cls = RayClassWithInitArgs(
+            cls = self.role_worker_mapping[Role.ActorRollout],
+            config = self.config.actor_rollout_ref,
+            role=str(Role.ActorRollout),
+        )
+
+        ref_cls = RayClassWithInitArgs(
+            cls = self.role_worker_mapping[Role.RefPolicy],
+            config = self.config.actor_rollout_ref,
+            role=str(Role.RefPolicy),
+        )
+
+        class_dict = {
+            str(Role.ActorRollout): actor_rollout_cls,
+            str(Role.RefPolicy): ref_cls,
+        }
+
+        # update resource pool to cls dict
+        if resource_pool not in self.resource_pool_to_cls:
+            self.resource_pool_to_cls[resource_pool] = {}
+        self.resource_pool_to_cls[resource_pool].update(class_dict)
+
+        # create worker dict cls and wg
+        wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
+        if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
+            wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
+        if OmegaConf.select(self.config.global_profiler, "steps") is not None:
+            wg_kwargs["profile_steps"] = OmegaConf.select(self.config.global_profiler, "steps")
+            # Only require nsight worker options when tool is nsys
+            if OmegaConf.select(self.config.global_profiler, "tool") == "nsys":
+                assert (
+                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
+                    is not None
+                ), "worker_nsight_options must be set when using nsys with profile_steps"
+                wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(
+                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
+                )
+        wg_kwargs["device_name"] = self.device_name
+        worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
+        wg_dict = self.ray_worker_group_cls(
+            resource_pool=resource_pool,
+            ray_cls_with_init=worker_dict_cls,
+            **wg_kwargs,
+        )
+        spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
+        self.actor_rollout_wg = spawn_wg[str(Role.ActorRollout)]
+        self.ref_policy_wg = spawn_wg[str(Role.RefPolicy)]
+
+        # initialize models
+        print("initializing actor rollout models")
+        self.actor_rollout_wg.init_model()
+        print("actor rollout models initialized")
+        print("initializing ref policy models")
+        self.ref_policy_wg.init_model()
+        print("ref policy models initialized")
+
+        # create async rollout manager and request scheduler
+        self.async_rollout_mode = False
+        if self.config.actor_rollout_ref.rollout.mode == "async":
+            from verl.experimental.agent_loop import AgentLoopManager
+            self.async_rollout_mode = True
+            self.async_rollout_manager = AgentLoopManager(
+                config=self.config, worker_group=self.actor_rollout_wg, rm_wg=self.rm_wg
+            )
+
+        print("[INFO] Actor rollout and reference policy worker groups recovered")
+
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1170,7 +1268,6 @@ class RayPPOTrainer:
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
-                gen_batch.meta_info[per_request_generated_tokens]= per_request_generated_tokens
                 gen_batch_output = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )                
