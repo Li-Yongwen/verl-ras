@@ -929,6 +929,14 @@ class RayPPOTrainer:
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
+        # rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+        # rollout_file = f"{rollout_data_dir}/{self.global_steps+1}.data"
+        # print(f"DEBUG try load rollout from {rollout_file}")
+        # try:
+        #     self._recoverd_rollout = DataProto.load_from_disk(rollout_file)
+        # except Exception as e:
+        #     print(f"DEBUG load rollout data failed, due to {e}")
+
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
         if do_profile:
@@ -1046,6 +1054,24 @@ class RayPPOTrainer:
 
         # Return unchanged batch and empty metrics if IS is disabled
         return batch, {}
+
+    def _load_rollout(self):
+        rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+        rollout_file = f"{rollout_data_dir}/{self.global_steps}.data"
+        print(f"DEBUG try load rollout from {rollout_file}")
+        try:
+            return DataProto.load_from_disk(rollout_file)
+        except Exception as e:
+            print(f"DEBUG load rollout data failed, due to {e}")
+            return None
+
+    def _save_rollout(self, batch):
+        rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+        if rollout_data_dir is None:
+            return
+        rollout_file = f"{rollout_data_dir}/{self.global_steps}.data"
+        batch.save_to_disk(rollout_file)
+
     def _parse_req_tokens(self, token_per_req: dict) -> dict:
         """
         从新的 step_result 数据结构中提取 tokens 信息。

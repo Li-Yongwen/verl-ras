@@ -2,14 +2,14 @@ set -x
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    data.train_files=/home/l30055792/datasets/gsm8k/train.parquet \
-    data.val_files=/home/l30055792/datasets/gsm8k/test.parquet \
+    data.train_files=datasets/gsm8k/train.parquet \
+    data.val_files=datasets/gsm8k/test.parquet \
     data.train_batch_size=32 \
     data.max_prompt_length=1024 \
     data.max_response_length=1024 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
-    actor_rollout_ref.model.path=/home/l30055792/models/Qwen2.5-7B-Instruct \
+    actor_rollout_ref.model.path=models/Qwen2.5-7B-Instruct \
     actor_rollout_ref.actor.optim.lr=5e-8 \
     actor_rollout_ref.model.use_remove_padding=False \
     actor_rollout_ref.actor.ppo_mini_batch_size=32 \

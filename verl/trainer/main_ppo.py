@@ -79,10 +79,10 @@ def run_ppo(config, task_runner_class=None) -> None:
     # Create a remote instance of the TaskRunner class, and
     # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
     if (
-        is_cuda_available
-        and config.global_profiler.tool == "nsys"
-        and config.global_profiler.get("steps") is not None
-        and len(config.global_profiler.get("steps", [])) > 0
+            is_cuda_available
+            and config.global_profiler.tool == "nsys"
+            and config.global_profiler.get("steps") is not None
+            and len(config.global_profiler.get("steps", [])) > 0
     ):
         from verl.utils.import_utils import is_nvtx_available
 
@@ -435,5 +435,72 @@ def create_rl_sampler(data_config, dataset):
     return sampler
 
 
+from typing import List
+from time import time
+
+import torch
+import megatron
+
+from torch.distributed._shard.metadata import ShardMetadata
+from torch.distributed.checkpoint import SavePlan, Metadata, CheckpointException
+from torch.distributed.checkpoint.utils import _DistWrapper, _get_failure_dict
+from megatron.core.dist_checkpointing.strategies.async_utils import AsyncRequest
+from megatron.core.dist_checkpointing.strategies.state_dict_saver import logger
+from megatron.core.dist_checkpointing.strategies.torch import TorchDistSaveShardedStrategy
+
+
+def _validate_global_plan(global_plan: List[SavePlan], metadata: Metadata) -> bool:
+    return True
+
+
+def validate_non_overlapping_shards_metadata(shards: List[ShardMetadata]):
+    return
+
+
+def save_state_dict_async_finalize(storage_writer, global_metadata, dist_wrapper) -> None:
+    world_size = torch.distributed.get_world_size()
+    global_ranks = list(range(world_size))
+    new_gloo_group = torch.distributed.new_group(global_ranks, backend="gloo", use_local_synchronization=True)
+
+    write_results = storage_writer.retrieve_write_results()
+
+    gather_start = time()
+    origin_group = dist_wrapper.group
+    dist_wrapper.group = new_gloo_group
+
+    all_results = dist_wrapper.gather_object(write_results)
+
+    dist_wrapper.group = origin_group
+    gather_end = time()
+    logger.info(f"{gather_end}, {torch.distributed.get_rank()}, gather: {gather_end - gather_start}")
+
+    # Store the metadata on coordinator rank
+    if dist_wrapper.is_coordinator:
+        node_failures = _get_failure_dict(all_results)
+        if len(node_failures) == 0:
+            assert global_metadata is not None
+            write_start = time()
+            storage_writer.finish(global_metadata, all_results)
+            write_end = time()
+            logger.info(f"{write_end}, metadata_write: {write_end - write_start}")
+        else:
+            raise CheckpointException("write", node_failures)
+
+    torch.distributed.destroy_process_group(new_gloo_group)
+
+
+def _get_save_and_finalize_callbacks(self, writer, save_state_dict_ret):
+    save_fn_args = writer.get_save_function_and_args()
+    save_fn, preload_fn, save_args = save_fn_args
+
+    def finalize_fn():
+        save_state_dict_async_finalize(*save_state_dict_ret)
+
+    return AsyncRequest(save_fn, save_args, [finalize_fn], preload_fn=preload_fn)
+
+
 if __name__ == "__main__":
+    torch.distributed.checkpoint.default_planner._validate_global_plan = _validate_global_plan
+    torch.distributed._shard.sharding_spec._internals.validate_non_overlapping_shards_metadata = validate_non_overlapping_shards_metadata
+    # TorchDistSaveShardedStrategy._get_save_and_finalize_callbacks = _get_save_and_finalize_callbacks
     main()

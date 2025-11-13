@@ -439,7 +439,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             loop.run_until_complete(self.trainer_mode())
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def init_model(self):
+    def init_model(self, tokens_queue=None, requests_queue=None):
         if self.config.model.get("external_lib", None) is not None:
             # This is used to import external_lib into the huggingface systems
             import importlib
