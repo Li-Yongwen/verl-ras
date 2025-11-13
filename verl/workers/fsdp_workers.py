@@ -142,6 +142,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         Worker.__init__(self)
 
         self.config = config
+        self.raise_flag = True
         import torch.distributed
 
         if not torch.distributed.is_initialized():
@@ -997,6 +998,32 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             else self.tokenizer.pad_token_id,
         }
         prompts.meta_info.update(meta_info)
+
+        if self.raise_flag:
+            import json
+            import time
+            from json.decoder import JSONDecodeError
+
+            file_raise_flag = True
+            while true:
+                try:
+                    with open('raise_flag.json', 'r', encoding='utf-8') as f:
+                        file_raise_flag = json.load(f)['raise_flag']
+                except JSONDecodeError:
+                    time.sleep(2)
+                else:
+                    break
+            if file_raise_flag:
+                with open('raise_flag.json', 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                data['raise_flag'] = False
+
+                with open('raise_flag.json', 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=4)
+                    print("The json file written success")
+                time.sleep(10)
+                raise Exception("[tmp log]actor rollout worker raise exception")
 
         timing_generate = {}
         if self._is_actor:  # For rollout only, we do not switch context.

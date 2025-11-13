@@ -315,6 +315,7 @@ class RayPPOTrainer:
         self.config = config
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
+        self.thread_flag = True
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
@@ -1190,6 +1191,26 @@ class RayPPOTrainer:
 
         print("[INFO] Actor rollout and reference policy worker groups recovered")
 
+
+
+    def modify_json_file(self):
+        import json
+        import time
+        self.thread_flag = False
+        time.sleep(10)
+
+        try:
+            with open('raise_flag.json', 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            if not data['write_flag']:
+                data['write_flag'] = True
+                data['raise_flag'] = True
+                with open('raise_flag.json', 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=4)
+                    print("The json file written success")
+        except Exception as e:
+            print(f"Error modifying json file: {e}")
 
     def fit(self):
         """
