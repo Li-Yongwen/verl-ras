@@ -348,10 +348,10 @@ class RayPPOTrainer:
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
         self.tokens_queue= Queue()
-        self.requests_queue= Queue()        
+        self.requests_queue= Queue()
         self.index_prompt_tokens= defaultdict() # 临时存储
         self.requests_tokens = []
-        self._index_prompt_tokens_status = Queue() 
+        self._index_prompt_tokens_status = Queue()
         #通过_set_tokens_queue_readable_status和_get_tokens_queue_readable_status获取index_prompt_tokens_queue的可读状态
         self._index_prompt_tokens_status.put(1)
         self.index_prompt_tokens_queue = Queue()
@@ -360,7 +360,7 @@ class RayPPOTrainer:
         len_queue = self._index_prompt_tokens_status.size()
         for _ in range(len_queue):
             self._index_prompt_tokens_status.get()
-        if readable:    
+        if readable:
             self._index_prompt_tokens_status.put(1)
         else:
             return
@@ -549,7 +549,7 @@ class RayPPOTrainer:
             & batch.non_tensor_batch.keys()
         )
         # pop those keys for generation
-        batch_keys_to_pop = input_batch_keys_to_pop        
+        batch_keys_to_pop = input_batch_keys_to_pop
         non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_model_keys
         gen_batch = batch.pop(
             batch_keys=batch_keys_to_pop,
@@ -1090,8 +1090,10 @@ class RayPPOTrainer:
         self._set_tokens_queue_readable_status(readable=False)
         if self.index_prompt_tokens_queue.size()==0:
             self.index_prompt_tokens = {}
-        else:
+        elif self.index_prompt_tokens_queue.size()==1:
             self.index_prompt_tokens=self.index_prompt_tokens_queue.get()
+        else:
+            raise RuntimeError("index_prompt_tokens_queue size error")
         req_info = token_per_req.get("req_info", {})
         finished_global_ids=token_per_req.get("finished_global_ids",{})
         for global_req_id, req_info in req_info.items():
@@ -1237,6 +1239,21 @@ class RayPPOTrainer:
                     print("The json file written success")
         except Exception as e:
             print(f"Error modifying json file: {e}")
+
+
+    def _reset_tokens_queue(self, retry_times=10):
+        while (not self._get_tokens_queue_readable_status() and retry_times>0):
+            time.sleep(0.5)
+            retry_times-=1
+        if retry_times==0:
+            raise RuntimeError(f"get_tokens_queue_readable_status failed, have retried {retry_times} times.")
+        self._set_tokens_queue_readable_status(readable=False)
+        if self.index_prompt_tokens_queue.size() in [0, 1]:
+            if self.index_prompt_tokens_queue.size():
+                self.index_prompt_tokens_queue.get()
+        else:
+            raise RuntimeError("index_prompt_tokens_queue size error")
+        self._set_tokens_queue_readable_status(readable=True)
 
     def fit(self):
         """
@@ -1474,7 +1491,7 @@ class RayPPOTrainer:
 
                             try:
                                 import time, threading
-                                if self.thread_flag:                                    
+                                if self.thread_flag:
                                     thread = threading.Thread(target=self.modify_json_file)
                                     thread.start()
                                 gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
@@ -1485,6 +1502,8 @@ class RayPPOTrainer:
                                 gen_batch_output.non_tensor_batch["per_request_generated_tokens"] = np.zeros_like(
                                     gen_batch_output.non_tensor_batch["per_request_generated_tokens"]
                                 )
+                            finally:
+                                self._reset_tokens_queue()
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
 
