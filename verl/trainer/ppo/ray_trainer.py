@@ -1446,9 +1446,6 @@ class RayPPOTrainer:
                                     new_prompts, dtype=object)
                                 return gen_batch_output_tmp
 
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
-                            _update_gen_batch_with_partial_tokens(gen_batch_output_tmp)
-                            gen_batch_output_tmp = self.actor_rollout_wg.generate_sequences(gen_batch_output_tmp)
                             try:
                                 import time, threading
                                 if self.thread_flag:                                    

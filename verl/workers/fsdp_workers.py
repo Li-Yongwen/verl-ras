@@ -1005,7 +1005,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             from json.decoder import JSONDecodeError
 
             file_raise_flag = True
-            while true:
+            while True:
                 try:
                     with open('raise_flag.json', 'r', encoding='utf-8') as f:
                         file_raise_flag = json.load(f)['raise_flag']
