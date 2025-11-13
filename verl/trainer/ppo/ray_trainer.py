@@ -1428,6 +1428,19 @@ class RayPPOTrainer:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
                             _update_gen_batch_with_partial_tokens(gen_batch_output_tmp)
                             gen_batch_output_tmp = self.actor_rollout_wg.generate_sequences(gen_batch_output_tmp)
+                            try:
+                                import time, threading
+                                if self.thread_flag:                                    
+                                    thread = threading.Thread(target=self.modify_json_file)
+                                    thread.start()
+                                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
+                            except:
+                                self._recover_actor_rollout_ref_wg()
+                                _update_gen_batch_with_partial_tokens(gen_batch_output)
+                                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
+                                gen_batch_output.non_tensor_batch["per_request_generated_tokens"] = np.zeros_like(
+                                    gen_batch_output.non_tensor_batch["per_request_generated_tokens"]
+                                )
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
 
