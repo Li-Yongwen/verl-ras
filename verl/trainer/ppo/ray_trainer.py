@@ -1231,17 +1231,104 @@ class RayPPOTrainer:
             return None, False
         
         # 检测活着的worker
+        # 不仅要检查Ray actor状态，还要验证worker是否真正可用
         alive_workers = []
         alive_worker_names = []
+        dead_worker_indices = []
         
         # 获取worker names（可能为空）
         worker_names = getattr(self.actor_rollout_wg, '_worker_names', [])
         
+        print(f"[INFO] 开始检测 {len(self.actor_rollout_wg._workers)} 个worker的状态...")
+        
         for i, worker in enumerate(self.actor_rollout_wg._workers):
-            if self.actor_rollout_wg._is_worker_alive(worker):
+            # 第一步：检查Ray actor状态
+            is_alive_ray = self.actor_rollout_wg._is_worker_alive(worker)
+            
+            if not is_alive_ray:
+                print(f"[WARN] Worker {i} Ray actor状态为DEAD")
+                dead_worker_indices.append(i)
+                continue
+            
+            # 第二步：尝试实际调用worker来验证是否真正可用
+            # 使用一个轻量级的方法调用来验证（如果worker有get_node_id方法）
+            is_functional = True
+            try:
+                # 尝试获取worker的node_id，这是一个轻量级的调用
+                # 如果worker真的死了（比如GPU进程被杀），这个调用会失败
+                import ray
+                node_id_future = worker.get_node_id.remote() if hasattr(worker, 'get_node_id') else None
+                if node_id_future is not None:
+                    # 设置超时，避免长时间等待
+                    node_id = ray.get(node_id_future, timeout=2.0)
+                    print(f"[INFO] Worker {i} 在节点 {node_id} 上，状态正常")
+            except Exception as e:
+                print(f"[WARN] Worker {i} Ray actor显示ALIVE但实际调用失败: {e}")
+                print(f"[WARN] 可能是GPU进程被杀但Ray actor未更新状态，标记为不可用")
+                is_functional = False
+                dead_worker_indices.append(i)
+            
+            if is_functional:
                 alive_workers.append(worker)
                 if i < len(worker_names):
                     alive_worker_names.append(worker_names[i])
+            else:
+                dead_worker_indices.append(i)
+        
+        if dead_worker_indices:
+            print(f"[WARN] 发现 {len(dead_worker_indices)} 个不可用的worker: {dead_worker_indices}")
+        
+        # 第三步：按节点/卡分组检测，避免将已死卡上的worker包含进来
+        # 如果一张卡上的进程被杀，同卡上的其他worker可能也会受影响
+        worker_node_map = {}  # node_id -> [worker_indices]
+        worker_node_id_map = {}  # worker_index -> node_id
+        
+        # 收集所有活着的worker的节点信息
+        for i, worker in enumerate(self.actor_rollout_wg._workers):
+            if i not in dead_worker_indices:
+                try:
+                    import ray
+                    node_id_future = worker.get_node_id.remote() if hasattr(worker, 'get_node_id') else None
+                    if node_id_future is not None:
+                        node_id = ray.get(node_id_future, timeout=1.0)
+                        if node_id not in worker_node_map:
+                            worker_node_map[node_id] = []
+                        worker_node_map[node_id].append(i)
+                        worker_node_id_map[i] = node_id
+                except Exception as e:
+                    print(f"[WARN] 无法获取worker {i}的节点信息: {e}")
+        
+        # 检查是否有节点上的所有worker都死了
+        # 如果有节点上的所有worker都死了，说明该节点/卡可能有问题
+        original_total_workers = len(self.actor_rollout_wg._workers)
+        all_worker_nodes = set()
+        for i in range(original_total_workers):
+            try:
+                worker = self.actor_rollout_wg._workers[i]
+                if hasattr(worker, 'get_node_id'):
+                    import ray
+                    node_id = ray.get(worker.get_node_id.remote(), timeout=1.0)
+                    all_worker_nodes.add(node_id)
+            except:
+                pass
+        
+        # 检查每个节点上的worker存活情况
+        nodes_with_dead_workers = []
+        for node_id in all_worker_nodes:
+            node_workers = [i for i in range(original_total_workers) if worker_node_id_map.get(i) == node_id]
+            node_alive_workers = [i for i in node_workers if i not in dead_worker_indices]
+            if len(node_alive_workers) < len(node_workers):
+                nodes_with_dead_workers.append((node_id, len(node_alive_workers), len(node_workers)))
+                print(f"[WARN] 节点 {node_id} 上有 {len(node_workers) - len(node_alive_workers)}/{len(node_workers)} 个worker死亡")
+        
+        # 如果某个节点上的所有worker都死了，给出警告
+        for node_id, alive_count, total_count in nodes_with_dead_workers:
+            if alive_count == 0:
+                print(f"[ERROR] 节点 {node_id} 上的所有 {total_count} 个worker都死了！")
+                print(f"[ERROR] 这可能意味着该节点/卡上的进程被完全杀掉了")
+        
+        # 在TP/DP配置下，如果一张卡上的worker死了，同卡上的其他worker可能也无法正常工作
+        # 但这里我们先尝试使用活着的worker继续，让后续的generate_sequences来验证
         
         # 如果所有worker都活着，返回None（使用原worker group）
         if len(alive_workers) == len(self.actor_rollout_wg._workers):
@@ -1296,11 +1383,87 @@ class RayPPOTrainer:
             # 解包Ray remote类，获取原始类
             from verl.single_controller.ray.base import _unwrap_ray_remote
             original_cls = _unwrap_ray_remote(original_ray_cls_with_init.cls)
+            
             # 绑定方法
-            temp_wg._bind_worker_method(original_cls, func_generator)
-            # 更新ray_cls_with_init，以便后续使用
+            print(f"[INFO] 绑定worker方法，原始类: {original_cls}")
+            method_names = temp_wg._bind_worker_method(original_cls, func_generator)
+            print(f"[INFO] 已绑定方法: {method_names}")
+
+            # 校验 generate_sequences 是否绑定
+            if 'generate_sequences' not in method_names:
+                print(f"[WARN] generate_sequences 未绑定，已绑定: {method_names}")
+                # 检查原始类是否有 generate_sequences 方法
+                if hasattr(original_cls, 'generate_sequences'):
+                    method = getattr(original_cls, 'generate_sequences')
+                    from verl.single_controller.base.decorator import MAGIC_ATTR as MAGIC_ATTR_CHECK
+                    if hasattr(method, MAGIC_ATTR_CHECK):
+                        print("[INFO] 原始类有 generate_sequences 方法，尝试手动绑定")
+                        # 手动绑定 generate_sequences
+                        try:
+                            from verl.single_controller.base.decorator import (
+                                get_predefined_dispatch_fn,
+                                get_predefined_execute_fn,
+                                MAGIC_ATTR as MAGIC_ATTR_IMPORT,
+                                Dispatch,
+                            )
+                            attribute = getattr(method, MAGIC_ATTR_IMPORT)
+                            dispatch_mode = attribute["dispatch_mode"]
+                            execute_mode = attribute["execute_mode"]
+                            blocking = attribute["blocking"]
+                            
+                            # 获取 dispatch 和 collect 函数
+                            if isinstance(dispatch_mode, Dispatch):
+                                fn = get_predefined_dispatch_fn(dispatch_mode=dispatch_mode)
+                                dispatch_fn = fn["dispatch_fn"]
+                                collect_fn = fn["collect_fn"]
+                            else:
+                                dispatch_fn = dispatch_mode["dispatch_fn"]
+                                collect_fn = dispatch_mode["collect_fn"]
+                            
+                            # 获取 execute 函数
+                            execute_mode_dict = get_predefined_execute_fn(execute_mode=execute_mode)
+                            wg_execute_fn_name = execute_mode_dict["execute_fn_name"]
+                            execute_fn = getattr(temp_wg, wg_execute_fn_name)
+                            
+                            # 生成并绑定方法
+                            func = func_generator(
+                                temp_wg,
+                                'generate_sequences',
+                                dispatch_fn=dispatch_fn,
+                                collect_fn=collect_fn,
+                                execute_fn=execute_fn,
+                                blocking=blocking,
+                            )
+                            setattr(temp_wg, 'generate_sequences', func)
+                            print("[INFO] ✓ generate_sequences 方法手动绑定成功")
+                        except Exception as e:
+                            print(f"[ERROR] 手动绑定 generate_sequences 失败: {e}")
+                            import traceback
+                            traceback.print_exc()
+                    else:
+                        print("[WARN] generate_sequences 方法没有 @register 装饰器")
+                else:
+                    print("[ERROR] 原始类没有 generate_sequences 方法")
+            else:
+                print("[INFO] ✓ generate_sequences 方法绑定成功")
+
             temp_wg.ray_cls_with_init = original_ray_cls_with_init
+        else:
+            print("[WARN] 原worker group无 ray_cls_with_init，无法绑定方法")
+            # 如果原worker group有方法，尝试手动绑定
+            if hasattr(self.actor_rollout_wg, 'generate_sequences'):
+                print("[INFO] 原worker group有 generate_sequences，但缺少 ray_cls_with_init")
+                print("[WARN] 无法绑定方法，需要 ray_cls_with_init")
         
+        # 最终验证：确保 generate_sequences 方法存在
+        if not hasattr(temp_wg, 'generate_sequences'):
+            raise AttributeError(
+                f"临时worker group缺少 generate_sequences 方法！"
+                f"已绑定的方法: {getattr(temp_wg, 'method_names', 'unknown')}, "
+                f"原worker group有方法: {hasattr(self.actor_rollout_wg, 'generate_sequences')}"
+            )
+        
+        print("[INFO] ✓ 临时worker group创建成功，generate_sequences 方法可用")
         return temp_wg, False
 
     def modify_json_file(self):
@@ -1578,6 +1741,7 @@ class RayPPOTrainer:
                                 except Exception as e:
                                     print(f"[WARN] Worker failure detected during generate_sequences: {e}")
                                     # 检测活着的worker并创建临时worker group
+                                    breakpoint()
                                     alive_wg, all_dead = self._get_alive_worker_group()
                                     
                                     # 如果所有worker都死了，需要完全恢复worker group
@@ -1594,6 +1758,30 @@ class RayPPOTrainer:
                                     
                                     # 使用活着的worker继续推理
                                     gen_batch_output = worker_group_to_use.generate_sequences(gen_batch_output)
+                                    
+                                    # 验证输出维度是否正确（与备份比较）
+                                    try:
+                                        from verl.trainer.ppo.validate_output_dimensions import validate_output_dimensions, print_data_proto_summary
+                                        
+                                        # 打印摘要信息
+                                        print_data_proto_summary(gen_batch_output, "恢复后的 gen_batch_output")
+                                        print_data_proto_summary(gen_batch_output_ori, "原始备份 gen_batch_output_ori")
+                                        
+                                        # 验证维度
+                                        validation_result = validate_output_dimensions(
+                                            gen_batch_output, 
+                                            gen_batch_output_ori, 
+                                            verbose=True
+                                        )
+                                        
+                                        if not validation_result['is_valid']:
+                                            print(f"[ERROR] 输出维度验证失败！发现 {len(validation_result['errors'])} 个错误")
+                                            # 可以选择抛出异常或继续执行
+                                            # raise ValueError(f"Output dimension validation failed: {validation_result['errors']}")
+                                        else:
+                                            print("[INFO] ✓ 输出维度验证通过！")
+                                    except Exception as e:
+                                        print(f"[WARN] 维度验证时出错: {e}")
                                     
                                     # 重置per_request_generated_tokens，因为这是从部分tokens继续生成的
                                     gen_batch_output.non_tensor_batch["per_request_generated_tokens"] = np.zeros_like(
