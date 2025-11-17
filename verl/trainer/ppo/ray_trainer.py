@@ -1571,42 +1571,74 @@ class RayPPOTrainer:
                                     new_prompts, dtype=object)
                                 return gen_batch_output_tmp
 
-                            try:
-                                import time, threading
-                                if self.thread_flag:
-                                    thread = threading.Thread(target=self.modify_json_file)
-                                    thread.start()
-                                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
-                            except Exception as e:
-                                print(f"[WARN] Worker failure detected during generate_sequences: {e}")
-                                # 检测活着的worker并创建临时worker group
-                                alive_wg, all_dead = self._get_alive_worker_group()
-                                
-                                # 如果所有worker都死了，需要完全恢复worker group
-                                if all_dead:
-                                    print("[ERROR] All workers are dead, attempting full recovery...")
-                                    self._recover_actor_rollout_ref_wg()
-                                    alive_wg = None  # 恢复后使用新的worker group
-                                
-                                # 使用活着的worker group（如果所有worker都活着，alive_wg为None，使用原worker group）
-                                worker_group_to_use = alive_wg if alive_wg is not None else self.actor_rollout_wg
-                                
-                                # 从队列中获取已生成的tokens并更新gen_batch_output
-                                _update_gen_batch_with_partial_tokens(gen_batch_output)
-                                
-                                # 使用活着的worker继续推理
-                                gen_batch_output = worker_group_to_use.generate_sequences(gen_batch_output)
-                                
-                                # 重置per_request_generated_tokens，因为这是从部分tokens继续生成的
-                                gen_batch_output.non_tensor_batch["per_request_generated_tokens"] = np.zeros_like(
-                                    gen_batch_output.non_tensor_batch["per_request_generated_tokens"]
-                                )
-                                
-                                # 如果使用了临时worker group，可以选择是否完全恢复worker group
-                                # 这里暂时不恢复，让后续的调用继续使用临时worker group
-                                # 如果需要完全恢复，可以调用 self._recover_actor_rollout_ref_wg()
-                            finally:
-                                self._reset_tokens_queue()
+                            DEBUG_EXCEPTION_ONLY = getattr(self, "debug_exception_only", True)
+                            if DEBUG_EXCEPTION_ONLY:
+                                try:
+                                    raise Exception("DEBUG_EXCEPTION_ONLY active, only running except branch")
+                                except Exception as e:
+                                    print(f"[WARN] Worker failure detected during generate_sequences: {e}")
+                                    # 检测活着的worker并创建临时worker group
+                                    alive_wg, all_dead = self._get_alive_worker_group()
+                                    
+                                    # 如果所有worker都死了，需要完全恢复worker group
+                                    if all_dead:
+                                        print("[ERROR] All workers are dead, attempting full recovery...")
+                                        self._recover_actor_rollout_ref_wg()
+                                        alive_wg = None  # 恢复后使用新的worker group
+                                    
+                                    # 使用活着的worker group（如果所有worker都活着，alive_wg为None，使用原worker group）
+                                    worker_group_to_use = alive_wg if alive_wg is not None else self.actor_rollout_wg
+                                    
+                                    # 从队列中获取已生成的tokens并更新gen_batch_output
+                                    _update_gen_batch_with_partial_tokens(gen_batch_output)
+                                    
+                                    # 使用活着的worker继续推理
+                                    gen_batch_output = worker_group_to_use.generate_sequences(gen_batch_output)
+                                    
+                                    # 重置per_request_generated_tokens，因为这是从部分tokens继续生成的
+                                    gen_batch_output.non_tensor_batch["per_request_generated_tokens"] = np.zeros_like(
+                                        gen_batch_output.non_tensor_batch["per_request_generated_tokens"]
+                                    )
+                                    
+                                finally:
+                                    self._reset_tokens_queue()
+                            else:
+                                try:
+                                    import time, threading
+                                    if self.thread_flag:
+                                        thread = threading.Thread(target=self.modify_json_file)
+                                        thread.start()
+                                    gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
+                                except Exception as e:
+                                    print(f"[WARN] Worker failure detected during generate_sequences: {e}")
+                                    # 检测活着的worker并创建临时worker group
+                                    alive_wg, all_dead = self._get_alive_worker_group()
+                                    
+                                    # 如果所有worker都死了，需要完全恢复worker group
+                                    if all_dead:
+                                        print("[ERROR] All workers are dead, attempting full recovery...")
+                                        self._recover_actor_rollout_ref_wg()
+                                        alive_wg = None  # 恢复后使用新的worker group
+                                    
+                                    # 使用活着的worker group（如果所有worker都活着，alive_wg为None，使用原worker group）
+                                    worker_group_to_use = alive_wg if alive_wg is not None else self.actor_rollout_wg
+                                    
+                                    # 从队列中获取已生成的tokens并更新gen_batch_output
+                                    _update_gen_batch_with_partial_tokens(gen_batch_output)
+                                    
+                                    # 使用活着的worker继续推理
+                                    gen_batch_output = worker_group_to_use.generate_sequences(gen_batch_output)
+                                    
+                                    # 重置per_request_generated_tokens，因为这是从部分tokens继续生成的
+                                    gen_batch_output.non_tensor_batch["per_request_generated_tokens"] = np.zeros_like(
+                                        gen_batch_output.non_tensor_batch["per_request_generated_tokens"]
+                                    )
+                                    
+                                    # 如果使用了临时worker group，可以选择是否完全恢复worker group
+                                    # 这里暂时不恢复，让后续的调用继续使用临时worker group
+                                    # 如果需要完全恢复，可以调用 self._recover_actor_rollout_ref_wg()
+                                finally:
+                                    self._reset_tokens_queue()
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
 
