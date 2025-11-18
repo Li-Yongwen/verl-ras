@@ -1973,197 +1973,34 @@ class RayPPOTrainer:
             print(f"[INFO] 绑定worker方法，原始类: {original_cls}")
             method_names = temp_wg._bind_worker_method(original_cls, func_generator)
             print(f"[INFO] 已绑定方法: {method_names}")
-
-            # 校验 generate_sequences 是否绑定
-            if 'generate_sequences' not in method_names:
-                print(f"[WARN] generate_sequences 未绑定，已绑定: {method_names}")
-                # 检查原始类是否有 generate_sequences 方法
-                if hasattr(original_cls, 'generate_sequences'):
-                    method = getattr(original_cls, 'generate_sequences')
-                    from verl.single_controller.base.decorator import MAGIC_ATTR as MAGIC_ATTR_CHECK
-                    if hasattr(method, MAGIC_ATTR_CHECK):
-                        print("[INFO] 原始类有 generate_sequences 方法，尝试手动绑定")
-                        # 手动绑定 generate_sequences
-                        try:
-                            from verl.single_controller.base.decorator import (
-                                get_predefined_dispatch_fn,
-                                get_predefined_execute_fn,
-                                MAGIC_ATTR as MAGIC_ATTR_IMPORT,
-                                Dispatch,
-                            )
-                            attribute = getattr(method, MAGIC_ATTR_IMPORT)
-                            dispatch_mode = attribute["dispatch_mode"]
-                            execute_mode = attribute["execute_mode"]
-                            blocking = attribute["blocking"]
-                            
-                            # 获取 dispatch 和 collect 函数
-                            if isinstance(dispatch_mode, Dispatch):
-                                fn = get_predefined_dispatch_fn(dispatch_mode=dispatch_mode)
-                                dispatch_fn = fn["dispatch_fn"]
-                                collect_fn = fn["collect_fn"]
-                            else:
-                                dispatch_fn = dispatch_mode["dispatch_fn"]
-                                collect_fn = dispatch_mode["collect_fn"]
-                            
-                            # 获取 execute 函数
-                            execute_mode_dict = get_predefined_execute_fn(execute_mode=execute_mode)
-                            wg_execute_fn_name = execute_mode_dict["execute_fn_name"]
-                            execute_fn = getattr(temp_wg, wg_execute_fn_name)
-                            
-                            # 生成并绑定方法
-                            func = func_generator(
-                                temp_wg,
-                                'generate_sequences',
-                                dispatch_fn=dispatch_fn,
-                                collect_fn=collect_fn,
-                                execute_fn=execute_fn,
-                                blocking=blocking,
-                            )
-                            setattr(temp_wg, 'generate_sequences', func)
-                            print("[INFO] ✓ generate_sequences 方法手动绑定成功")
-                        except Exception as e:
-                            print(f"[ERROR] 手动绑定 generate_sequences 失败: {e}")
-                            import traceback
-                            traceback.print_exc()
-                    else:
-                        print("[WARN] generate_sequences 方法没有 @register 装饰器")
-                        # 无法绑定方法，因为缺少@register装饰器
-                        print("[ERROR] 无法绑定 generate_sequences 方法：缺少 @register 装饰器")
-                else:
-                    print("[ERROR] 原始类没有 generate_sequences 方法")
-                    # 原始类没有generate_sequences方法，可能是colocated worker模式
-                    # 在这种情况下，需要检查原worker group是否有这个方法
-                    if hasattr(self.actor_rollout_wg, 'generate_sequences'):
-                        print("[WARN] 原始类没有 generate_sequences 方法，但原worker group有")
-                        print("[WARN] 这可能是colocated worker模式，方法在WorkerDict中动态绑定")
-                        # 尝试从colocated worker的原始类中提取方法信息并动态绑定
-                        try:
-                            # 尝试从ray_cls_with_init中获取原始类字典（colocated worker模式）
-                            ray_cls_with_init = getattr(self.actor_rollout_wg, 'ray_cls_with_init', None)
-                            if ray_cls_with_init is not None:
-                                # 检查是否是colocated worker模式（有raw_cls_dict属性）
-                                if hasattr(ray_cls_with_init, 'raw_cls_dict') or hasattr(ray_cls_with_init.cls, 'raw_cls_dict'):
-                                    print("[INFO] 检测到colocated worker模式，尝试从原始类中提取方法信息")
-                                    # 尝试从原始类字典中查找generate_sequences方法
-                                    found_method = None
-                                    found_cls_name = None
-                                    
-                                    # 方法1：从ray_cls_with_init.cls的raw_cls_dict获取
-                                    try:
-                                        if hasattr(ray_cls_with_init.cls, 'raw_cls_dict'):
-                                            raw_cls_dict = ray_cls_with_init.cls.raw_cls_dict
-                                            for cls_name, raw_cls in raw_cls_dict.items():
-                                                if hasattr(raw_cls, 'generate_sequences'):
-                                                    found_method = getattr(raw_cls, 'generate_sequences')
-                                                    found_cls_name = cls_name
-                                                    print(f"[INFO] 在colocated worker的 {cls_name} 类中找到 generate_sequences 方法")
-                                                    break
-                                    except:
-                                        pass
-                                    
-                                    # 方法2：从ray_cls_with_init的raw_cls_dict获取（如果存在）
-                                    if found_method is None:
-                                        try:
-                                            if hasattr(ray_cls_with_init, 'raw_cls_dict'):
-                                                raw_cls_dict = ray_cls_with_init.raw_cls_dict
-                                                for cls_name, raw_cls in raw_cls_dict.items():
-                                                    if hasattr(raw_cls, 'generate_sequences'):
-                                                        found_method = getattr(raw_cls, 'generate_sequences')
-                                                        found_cls_name = cls_name
-                                                        print(f"[INFO] 在colocated worker的 {cls_name} 类中找到 generate_sequences 方法")
-                                                        break
-                                        except:
-                                            pass
-                                    
-                                    # 如果找到了方法，尝试提取MAGIC_ATTR并重新绑定
-                                    if found_method is not None:
-                                        from verl.single_controller.base.decorator import MAGIC_ATTR
-                                        if hasattr(found_method, MAGIC_ATTR):
-                                            print(f"[INFO] 从 {found_cls_name} 类中提取 generate_sequences 方法的绑定信息")
-                                            attribute = getattr(found_method, MAGIC_ATTR)
-                                            dispatch_mode = attribute["dispatch_mode"]
-                                            execute_mode = attribute["execute_mode"]
-                                            blocking = attribute["blocking"]
-                                            
-                                            # 获取 dispatch 和 collect 函数
-                                            from verl.single_controller.base.decorator import (
-                                                get_predefined_dispatch_fn,
-                                                get_predefined_execute_fn,
-                                                Dispatch,
-                                            )
-                                            if isinstance(dispatch_mode, Dispatch):
-                                                fn = get_predefined_dispatch_fn(dispatch_mode=dispatch_mode)
-                                                dispatch_fn = fn["dispatch_fn"]
-                                                collect_fn = fn["collect_fn"]
-                                            else:
-                                                dispatch_fn = dispatch_mode["dispatch_fn"]
-                                                collect_fn = dispatch_mode["collect_fn"]
-                                            
-                                            # 获取 execute 函数
-                                            execute_mode_dict = get_predefined_execute_fn(execute_mode=execute_mode)
-                                            wg_execute_fn_name = execute_mode_dict["execute_fn_name"]
-                                            execute_fn = getattr(temp_wg, wg_execute_fn_name)
-                                            
-                                            # 生成并绑定方法
-                                            func = func_generator(
-                                                temp_wg,
-                                                'generate_sequences',
-                                                dispatch_fn=dispatch_fn,
-                                                collect_fn=collect_fn,
-                                                execute_fn=execute_fn,
-                                                blocking=blocking,
-                                            )
-                                            setattr(temp_wg, 'generate_sequences', func)
-                                            print("[INFO] ✓ 为临时worker group动态绑定 generate_sequences 方法成功（从colocated worker提取）")
-                                        else:
-                                            raise AttributeError(
-                                                f"在 {found_cls_name} 类中找到 generate_sequences 方法，但缺少 @register 装饰器"
-                                            )
-                                    else:
-                                        raise AttributeError(
-                                            "无法在colocated worker的原始类中找到 generate_sequences 方法"
-                                        )
-                                else:
-                                    # 不是colocated worker模式，但原始类没有方法
-                                    raise AttributeError(
-                                        "原始类没有 generate_sequences 方法，且不是colocated worker模式"
-                                    )
-                            else:
-                                raise AttributeError(
-                                    "原worker group没有 ray_cls_with_init，无法提取方法信息"
-                                )
-                        except AttributeError as e:
-                            # 如果是我们抛出的AttributeError，直接重新抛出
-                            raise
-                        except Exception as e:
-                            print(f"[ERROR] 动态绑定 generate_sequences 失败: {e}")
-                            import traceback
-                            traceback.print_exc()
-                            raise AttributeError(
-                                f"无法为临时worker group动态绑定 generate_sequences 方法：{e}"
-                            ) from e
-                    else:
-                        raise AttributeError(
-                            "原始类没有 generate_sequences 方法，且原worker group也没有此方法。"
-                            "无法创建临时worker group。"
-                        )
-            else:
-                print("[INFO] ✓ generate_sequences 方法绑定成功")
-
-            temp_wg.ray_cls_with_init = original_ray_cls_with_init
-        else:
-            print("[WARN] 原worker group无 ray_cls_with_init，无法绑定方法")
-            # 如果原worker group有方法，尝试手动绑定
-            if hasattr(self.actor_rollout_wg, 'generate_sequences'):
-                print("[INFO] 原worker group有 generate_sequences，但缺少 ray_cls_with_init")
-                print("[WARN] 无法绑定方法，需要 ray_cls_with_init")
+            
+            # 检查是否需要重新绑定带前缀的方法
+            # 即使fused_worker_used=False，如果使用了create_colocated_worker_cls，方法也可能有前缀
+            # 参考 spawn 方法中的 _rebind_actor_methods 逻辑
+            actor_rollout_prefix = str(Role.ActorRollout) + "_"
+            has_prefixed_methods = any(method_name.startswith(actor_rollout_prefix) for method_name in method_names)
+            
+            if has_prefixed_methods:
+                print(f"[INFO] 检测到带前缀的方法，重新绑定，prefix: {actor_rollout_prefix}")
+                
+                # 查找所有带前缀的方法并重新绑定
+                for method_name in list(method_names):
+                    if method_name.startswith(actor_rollout_prefix):
+                        original_method_name = method_name.removeprefix(actor_rollout_prefix)
+                        if hasattr(temp_wg, method_name):
+                            method = getattr(temp_wg, method_name)
+                            setattr(temp_wg, original_method_name, method)
+                            print(f"[INFO] 重新绑定方法: {method_name} -> {original_method_name}")
+                            if original_method_name not in method_names:
+                                method_names.append(original_method_name)
         
         # 最终验证：确保 generate_sequences 方法存在
         if not hasattr(temp_wg, 'generate_sequences'):
             raise AttributeError(
                 f"临时worker group缺少 generate_sequences 方法！"
                 f"已绑定的方法: {getattr(temp_wg, 'method_names', 'unknown')}, "
-                f"原worker group有方法: {hasattr(self.actor_rollout_wg, 'generate_sequences')}"
+                f"原worker group有方法: {hasattr(self.actor_rollout_wg, 'generate_sequences')}, "
+                f"ray_cls_with_init: {original_ray_cls_with_init is not None}"
             )
         
         print("[INFO] ✓ 临时worker group创建成功，generate_sequences 方法可用")
