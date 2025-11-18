@@ -355,6 +355,11 @@ class RayPPOTrainer:
         #通过_set_tokens_queue_readable_status和_get_tokens_queue_readable_status获取index_prompt_tokens_queue的可读状态
         self._index_prompt_tokens_status.put(1)
         self.index_prompt_tokens_queue = Queue()
+        
+        # 故障恢复相关标记
+        self._temp_worker_group = None  # 临时worker group（包含活着的worker）
+        self._need_recover_group = False  # 标记是否需要在推理完成后重拉group
+        self._using_temp_worker_group = False  # 标记当前是否正在使用临时worker group
 
     def _set_tokens_queue_readable_status(self, readable: bool):
         len_queue = self._index_prompt_tokens_status.size()
@@ -1219,6 +1224,367 @@ class RayPPOTrainer:
 
         print("[INFO] Actor rollout and reference policy worker groups recovered")
 
+    def _identify_associated_workers(self, dead_worker_indices, original_total_workers):
+        """
+        识别与已死worker关联的worker（TP组、节点等）。
+        
+        Args:
+            dead_worker_indices: 已死worker的索引列表
+            original_total_workers: 原始worker总数
+            
+        Returns:
+            set: 需要排除的worker索引集合（包括直接死掉的+关联的）
+        """
+        associated_dead_workers = set(dead_worker_indices)
+        
+        # 尝试从config获取TP/DP信息
+        # 优先从rollout配置获取，如果没有则从actor的megatron配置获取
+        tp_size = None
+        dp_size = 1
+        
+        if hasattr(self, 'config') and hasattr(self.config, 'actor_rollout_ref'):
+            # 尝试从rollout配置获取TP/DP信息
+            if hasattr(self.config.actor_rollout_ref, 'rollout'):
+                rollout_config = self.config.actor_rollout_ref.rollout
+                if hasattr(rollout_config, 'tensor_model_parallel_size'):
+                    tp_size = rollout_config.tensor_model_parallel_size
+                if hasattr(rollout_config, 'data_parallel_size'):
+                    dp_size = rollout_config.data_parallel_size
+            
+            # 如果rollout配置中没有，尝试从actor的megatron配置获取
+            if tp_size is None and hasattr(self.config.actor_rollout_ref, 'actor'):
+                if hasattr(self.config.actor_rollout_ref.actor, 'megatron'):
+                    megatron_config = self.config.actor_rollout_ref.actor.megatron
+                    if hasattr(megatron_config, 'tensor_model_parallel_size'):
+                        tp_size = megatron_config.tensor_model_parallel_size
+                    # megatron通常通过world_size和tp_size计算dp_size
+                    # 这里我们假设可以通过worker总数和tp_size计算
+                    if tp_size is not None and original_total_workers % tp_size == 0:
+                        dp_size = original_total_workers // tp_size
+        
+        # 如果找到了TP配置，计算TP组
+        if tp_size is not None and tp_size > 1:
+            print(f"[INFO] 检测到TP/DP配置: TP={tp_size}, DP={dp_size}")
+            print(f"[INFO] 总worker数: {original_total_workers}, 每个TP组大小: {tp_size}")
+            
+            # 尝试从worker group获取实际的dispatch信息来验证分组
+            # 参考原有实现：根据megatron的rank计算公式
+            # global_rank = ((pp_rank * dp_size + dp_rank) * cp_size + cp_rank) * tp_size + tp_rank
+            # 对于rollout，通常pp_size=1, cp_size=1，所以：global_rank = dp_rank * tp_size + tp_rank
+            # 因此：tp_rank = global_rank % tp_size, dp_rank = global_rank // tp_size
+            # TP组的分组方式：在同一个DP组内，连续的tp_size个worker组成一个TP组
+            # 即：tp_group_id = global_rank // tp_size
+            
+            # 尝试从worker group查询rollout mesh的dispatch信息来验证分组
+            dp_rank_mapping = None
+            try:
+                if hasattr(self, 'actor_rollout_wg') and self.actor_rollout_wg is not None:
+                    # 尝试查询rollout mesh的dispatch信息
+                    if hasattr(self.actor_rollout_wg, '_query_dispatch_info'):
+                        try:
+                            dp_rank_mapping = self.actor_rollout_wg._query_dispatch_info("rollout")
+                            print(f"[INFO] 从worker group获取到dispatch信息: {dp_rank_mapping}")
+                        except Exception as e:
+                            print(f"[WARN] 查询dispatch信息失败: {e}，将使用配置计算")
+                    elif "rollout" in getattr(self.actor_rollout_wg, '_dispatch_info', {}):
+                        dp_rank_mapping = self.actor_rollout_wg._dispatch_info["rollout"]
+                        print(f"[INFO] 从worker group缓存获取到dispatch信息: {dp_rank_mapping}")
+            except Exception as e:
+                print(f"[WARN] 从worker group获取dispatch信息失败: {e}，将使用配置计算")
+            
+            # 根据dispatch信息或配置计算TP组
+            tp_groups = {}
+            if dp_rank_mapping is not None and len(dp_rank_mapping) == original_total_workers:
+                # 使用dispatch信息计算TP组
+                # 相同dp_rank的worker属于同一个DP组，在DP组内按顺序分组为TP组
+                dp_groups = {}
+                for worker_idx in range(original_total_workers):
+                    dp_rank = dp_rank_mapping[worker_idx]
+                    if dp_rank not in dp_groups:
+                        dp_groups[dp_rank] = []
+                    dp_groups[dp_rank].append(worker_idx)
+                
+                # 在每个DP组内，按顺序分组为TP组
+                for dp_rank, dp_workers in dp_groups.items():
+                    # 在DP组内按顺序排序
+                    sorted_workers = sorted(dp_workers)
+                    # 每tp_size个worker组成一个TP组
+                    for local_idx, worker_idx in enumerate(sorted_workers):
+                        tp_group_id_in_dp = local_idx // tp_size
+                        # 使用全局唯一的TP组ID：dp_rank * (每个DP组的TP组数) + tp_group_id_in_dp
+                        # 每个DP组的TP组数 = len(dp_workers) // tp_size
+                        tp_groups_per_dp = len(sorted_workers) // tp_size
+                        tp_group_id = dp_rank * tp_groups_per_dp + tp_group_id_in_dp
+                        
+                        if tp_group_id not in tp_groups:
+                            tp_groups[tp_group_id] = []
+                        tp_groups[tp_group_id].append(worker_idx)
+            else:
+                # 使用配置计算（参考megatron的rank计算）
+                # 假设pp_size=1, cp_size=1，则：global_rank = dp_rank * tp_size + tp_rank
+                # TP组ID = global_rank // tp_size
+                for i in range(original_total_workers):
+                    tp_group_id = i // tp_size
+                    if tp_group_id not in tp_groups:
+                        tp_groups[tp_group_id] = []
+                    tp_groups[tp_group_id].append(i)
+            
+            # 检查每个TP组，如果有worker死了，标记整个TP组为不可用
+            for tp_group_id, tp_workers in tp_groups.items():
+                dead_in_group = [w for w in tp_workers if w in dead_worker_indices]
+                if dead_in_group:
+                    print(f"[WARN] TP组 {tp_group_id} 中有 {len(dead_in_group)}/{len(tp_workers)} 个worker死亡: {dead_in_group}")
+                    print(f"[WARN] TP组 {tp_group_id} 的所有worker ({tp_workers}) 都应该被排除，因为TP需要完整组")
+                    # 将整个TP组的所有worker都标记为需要排除
+                    associated_dead_workers.update(tp_workers)
+        else:
+            print(f"[INFO] 未找到TP配置或TP大小为1，跳过TP组关联检测")
+        
+        return associated_dead_workers
+    
+    def _rebuild_temp_worker_group(self, alive_workers, alive_worker_names):
+        """
+        重建临时worker group。
+        
+        Args:
+            alive_workers: 活着的worker列表
+            alive_worker_names: 活着的worker名称列表
+            
+        Returns:
+            RayWorkerGroup: 重建的临时worker group
+        """
+        from verl.single_controller.ray.base import RayWorkerGroup
+        
+        # 从原worker group复制ray_cls_with_init以正确绑定方法
+        ray_cls_with_init = getattr(self.actor_rollout_wg, 'ray_cls_with_init', None)
+        fused_worker_used = getattr(self.actor_rollout_wg, 'fused_worker_used', False)
+        
+        # 如果alive_worker_names为空，使用worker_handles的数量来创建虚拟names
+        if not alive_worker_names:
+            alive_worker_names = [f"alive_worker_{i}" for i in range(len(alive_workers))]
+        
+        # 如果ray_cls_with_init为None，创建一个临时的RayClassWithInitArgs
+        if ray_cls_with_init is None:
+            from verl.single_controller.ray.base import RayClassWithInitArgs
+            import ray
+            dummy_cls = ray.remote(lambda: None)
+            ray_cls_with_init = RayClassWithInitArgs(cls=dummy_cls)
+            ray_cls_with_init.fused_worker_used = fused_worker_used
+        
+        temp_wg = RayWorkerGroup(
+            detached=True,
+            worker_handles=alive_workers,
+            worker_names=alive_worker_names,
+            ray_cls_with_init=ray_cls_with_init,
+            device_name=self.device_name,
+        )
+        
+        # 确保_world_size正确设置为活着的worker数量
+        temp_wg._world_size = len(alive_workers)
+        
+        # 绑定worker方法（从原worker group复制）
+        original_ray_cls_with_init = getattr(self.actor_rollout_wg, 'ray_cls_with_init', None)
+        if original_ray_cls_with_init is not None:
+            from verl.single_controller.ray.base import _unwrap_ray_remote
+            from verl.single_controller.base.decorator import func_generator
+            original_cls = _unwrap_ray_remote(original_ray_cls_with_init.cls)
+            
+            # 绑定方法
+            print(f"[INFO] 绑定worker方法，原始类: {original_cls}")
+            method_names = temp_wg._bind_worker_method(original_cls, func_generator)
+            print(f"[INFO] 已绑定方法: {method_names}")
+            
+            # 校验 generate_sequences 是否绑定
+            if 'generate_sequences' not in method_names:
+                print(f"[WARN] generate_sequences 未绑定，已绑定: {method_names}")
+                # 检查原始类是否有 generate_sequences 方法
+                if hasattr(original_cls, 'generate_sequences'):
+                    method = getattr(original_cls, 'generate_sequences')
+                    from verl.single_controller.base.decorator import MAGIC_ATTR as MAGIC_ATTR_CHECK
+                    if hasattr(method, MAGIC_ATTR_CHECK):
+                        print("[INFO] 原始类有 generate_sequences 方法，尝试手动绑定")
+                        try:
+                            from verl.single_controller.base.decorator import (
+                                get_predefined_dispatch_fn,
+                                get_predefined_execute_fn,
+                                MAGIC_ATTR as MAGIC_ATTR_IMPORT,
+                                Dispatch,
+                            )
+                            attribute = getattr(method, MAGIC_ATTR_IMPORT)
+                            dispatch_mode = attribute["dispatch_mode"]
+                            execute_mode = attribute["execute_mode"]
+                            blocking = attribute["blocking"]
+                            
+                            # 获取 dispatch 和 collect 函数
+                            if isinstance(dispatch_mode, Dispatch):
+                                fn = get_predefined_dispatch_fn(dispatch_mode=dispatch_mode)
+                                dispatch_fn = fn["dispatch_fn"]
+                                collect_fn = fn["collect_fn"]
+                            else:
+                                dispatch_fn = dispatch_mode["dispatch_fn"]
+                                collect_fn = dispatch_mode["collect_fn"]
+                            
+                            # 获取 execute 函数
+                            execute_mode_dict = get_predefined_execute_fn(execute_mode=execute_mode)
+                            wg_execute_fn_name = execute_mode_dict["execute_fn_name"]
+                            execute_fn = getattr(temp_wg, wg_execute_fn_name)
+                            
+                            # 生成并绑定方法
+                            func = func_generator(
+                                temp_wg,
+                                'generate_sequences',
+                                dispatch_fn=dispatch_fn,
+                                collect_fn=collect_fn,
+                                execute_fn=execute_fn,
+                                blocking=blocking,
+                            )
+                            setattr(temp_wg, 'generate_sequences', func)
+                            print("[INFO] ✓ generate_sequences 方法手动绑定成功")
+                        except Exception as e:
+                            print(f"[ERROR] 手动绑定 generate_sequences 失败: {e}")
+                            import traceback
+                            traceback.print_exc()
+            
+            temp_wg.ray_cls_with_init = original_ray_cls_with_init
+        
+        # 最终验证：确保 generate_sequences 方法存在
+        if not hasattr(temp_wg, 'generate_sequences'):
+            raise AttributeError(
+                f"临时worker group缺少 generate_sequences 方法！"
+                f"已绑定的方法: {getattr(temp_wg, 'method_names', 'unknown')}, "
+                f"原worker group有方法: {hasattr(self.actor_rollout_wg, 'generate_sequences')}"
+            )
+        
+        print("[INFO] ✓ 临时worker group重建成功，generate_sequences 方法可用")
+        return temp_wg
+    
+    def _get_current_worker_group(self):
+        """
+        获取当前应该使用的worker group。
+        如果正在使用临时worker group，会检测其中的worker是否还活着，
+        如果有worker挂了，会清除相关worker（包括关联的worker）并重建临时worker group。
+        
+        Returns:
+            RayWorkerGroup: 当前应该使用的worker group
+        """
+        # 如果不在使用临时worker group，直接返回原worker group
+        if not self._using_temp_worker_group or self._temp_worker_group is None:
+            return self.actor_rollout_wg
+        
+        # 检测临时worker group中的worker是否还活着
+        print("[INFO] 检测临时worker group中的worker状态...")
+        temp_wg = self._temp_worker_group
+        dead_worker_indices_in_temp = []
+        alive_workers_in_temp = []
+        alive_worker_names_in_temp = []
+        
+        # 获取worker names（可能为空）
+        worker_names = getattr(temp_wg, '_worker_names', [])
+        original_total_workers = len(self.actor_rollout_wg._workers)
+        
+        # 需要建立临时worker group中的worker索引到原worker group中的worker索引的映射
+        # 由于临时worker group只包含活着的worker，我们需要找到每个worker在原worker group中的位置
+        temp_to_original_index_map = {}
+        for temp_idx, temp_worker in enumerate(temp_wg._workers):
+            # 尝试找到这个worker在原worker group中的索引
+            found = False
+            for orig_idx, orig_worker in enumerate(self.actor_rollout_wg._workers):
+                # 通过比较worker的actor_id来判断是否是同一个worker
+                try:
+                    if hasattr(temp_worker, '_actor_id') and hasattr(orig_worker, '_actor_id'):
+                        if temp_worker._actor_id == orig_worker._actor_id:
+                            temp_to_original_index_map[temp_idx] = orig_idx
+                            found = True
+                            break
+                except:
+                    pass
+            
+            if not found:
+                # 如果找不到映射，假设临时worker group中的worker索引对应原worker group中的前几个worker
+                # 这是一个简化的假设，可能不总是正确
+                print(f"[WARN] 无法找到临时worker {temp_idx} 在原worker group中的位置，使用简化映射")
+                temp_to_original_index_map[temp_idx] = temp_idx
+        
+        # 检测临时worker group中的每个worker
+        for temp_idx, worker in enumerate(temp_wg._workers):
+            # 第一步：检查Ray actor状态
+            is_alive_ray = temp_wg._is_worker_alive(worker)
+            
+            if not is_alive_ray:
+                orig_idx = temp_to_original_index_map.get(temp_idx, temp_idx)
+                print(f"[WARN] 临时worker group中的worker {temp_idx} (原索引 {orig_idx}) Ray actor状态为DEAD")
+                dead_worker_indices_in_temp.append(orig_idx)
+                continue
+            
+            # 第二步：尝试实际调用worker来验证是否真正可用
+            is_functional = True
+            try:
+                import ray
+                node_id_future = worker.get_node_id.remote() if hasattr(worker, 'get_node_id') else None
+                if node_id_future is not None:
+                    node_id = ray.get(node_id_future, timeout=2.0)
+                    orig_idx = temp_to_original_index_map.get(temp_idx, temp_idx)
+                    print(f"[INFO] 临时worker group中的worker {temp_idx} (原索引 {orig_idx}) 在节点 {node_id} 上，状态正常")
+            except Exception as e:
+                orig_idx = temp_to_original_index_map.get(temp_idx, temp_idx)
+                print(f"[WARN] 临时worker group中的worker {temp_idx} (原索引 {orig_idx}) Ray actor显示ALIVE但实际调用失败: {e}")
+                is_functional = False
+                dead_worker_indices_in_temp.append(orig_idx)
+            
+            if is_functional:
+                alive_workers_in_temp.append(worker)
+                if temp_idx < len(worker_names):
+                    alive_worker_names_in_temp.append(worker_names[temp_idx])
+        
+        # 如果没有worker挂了，直接返回临时worker group
+        if not dead_worker_indices_in_temp:
+            print("[INFO] 临时worker group中的所有worker都正常，继续使用")
+            return temp_wg
+        
+        print(f"[WARN] 发现临时worker group中有 {len(dead_worker_indices_in_temp)} 个worker挂了: {dead_worker_indices_in_temp}")
+        
+        # 识别关联worker（TP组等）
+        associated_dead_workers = self._identify_associated_workers(dead_worker_indices_in_temp, original_total_workers)
+        
+        # 重新计算活着的worker（从原worker group中）
+        alive_workers = []
+        alive_worker_names = []
+        original_worker_names = getattr(self.actor_rollout_wg, '_worker_names', [])
+        
+        for i, worker in enumerate(self.actor_rollout_wg._workers):
+            if i not in associated_dead_workers:
+                # 再次验证worker是否真的活着
+                is_alive = self.actor_rollout_wg._is_worker_alive(worker)
+                if is_alive:
+                    try:
+                        import ray
+                        node_id_future = worker.get_node_id.remote() if hasattr(worker, 'get_node_id') else None
+                        if node_id_future is not None:
+                            ray.get(node_id_future, timeout=1.0)
+                            alive_workers.append(worker)
+                            if i < len(original_worker_names):
+                                alive_worker_names.append(original_worker_names[i])
+                    except:
+                        print(f"[WARN] Worker {i} 验证失败，排除")
+        
+        if len(associated_dead_workers) > len(dead_worker_indices_in_temp):
+            newly_excluded = associated_dead_workers - set(dead_worker_indices_in_temp)
+            print(f"[WARN] 由于关联worker（TP组等），额外排除 {len(newly_excluded)} 个worker: {sorted(newly_excluded)}")
+        
+        if len(alive_workers) == 0:
+            print("[ERROR] 所有worker都死了，无法重建临时worker group")
+            self._using_temp_worker_group = False
+            self._temp_worker_group = None
+            self._need_recover_group = True
+            return self.actor_rollout_wg
+        
+        print(f"[INFO] 重建临时worker group，包含 {len(alive_workers)} 个活着的worker")
+        
+        # 重建临时worker group
+        self._temp_worker_group = self._rebuild_temp_worker_group(alive_workers, alive_worker_names)
+        
+        return self._temp_worker_group
+    
     def _get_alive_worker_group(self):
         """
         检测活着的worker并创建一个只包含活着worker的临时worker group。
@@ -1298,19 +1664,9 @@ class RayPPOTrainer:
                 except Exception as e:
                     print(f"[WARN] 无法获取worker {i}的节点信息: {e}")
         
-        # 检查是否有节点上的所有worker都死了
-        # 如果有节点上的所有worker都死了，说明该节点/卡可能有问题
+        # 收集所有节点的信息
+        all_worker_nodes = list(worker_node_map.keys())
         original_total_workers = len(self.actor_rollout_wg._workers)
-        all_worker_nodes = set()
-        for i in range(original_total_workers):
-            try:
-                worker = self.actor_rollout_wg._workers[i]
-                if hasattr(worker, 'get_node_id'):
-                    import ray
-                    node_id = ray.get(worker.get_node_id.remote(), timeout=1.0)
-                    all_worker_nodes.add(node_id)
-            except:
-                pass
         
         # 检查每个节点上的worker存活情况
         nodes_with_dead_workers = []
@@ -1326,6 +1682,53 @@ class RayPPOTrainer:
             if alive_count == 0:
                 print(f"[ERROR] 节点 {node_id} 上的所有 {total_count} 个worker都死了！")
                 print(f"[ERROR] 这可能意味着该节点/卡上的进程被完全杀掉了")
+        
+        # 第四步：检测TP/DP组的关联worker
+        # 在TP/DP配置下，如果同一个TP组中的某个worker死了，该TP组中的其他worker也应该被排除
+        # 因为TP组需要所有成员才能正常工作
+        associated_dead_workers = set(dead_worker_indices)  # 需要排除的worker集合（包括直接死掉的+关联的）
+        
+        # 尝试从worker获取TP/DP配置信息
+        # 通过查询worker的dispatch/collect信息来推断TP组
+        try:
+            # 尝试从第一个活着的worker获取配置信息
+            if alive_workers:
+                test_worker = alive_workers[0]
+                # 尝试获取rollout mesh的dispatch信息
+                try:
+                    import ray
+                    # 查询worker的rollout dispatch信息（如果worker支持）
+                    # 这需要worker有_query_dispatch_info方法
+                    if hasattr(test_worker, '_query_dispatch_info'):
+                        # 获取rollout mesh的dispatch信息
+                        dispatch_info_future = test_worker._query_dispatch_info.remote("rollout")
+                        dispatch_info = ray.get(dispatch_info_future, timeout=2.0)
+                        print(f"[INFO] 获取到rollout dispatch信息: {dispatch_info}")
+                except Exception as e:
+                    print(f"[WARN] 无法获取worker的dispatch信息: {e}")
+            
+            # 尝试从config获取TP/DP信息（如果有的话）
+            # 使用统一的_identify_associated_workers方法来识别关联worker
+            associated_dead_workers = self._identify_associated_workers(dead_worker_indices, original_total_workers)
+            
+            # 更新alive_workers，排除关联的worker
+            if len(associated_dead_workers) > len(dead_worker_indices):
+                newly_excluded = associated_dead_workers - set(dead_worker_indices)
+                print(f"[WARN] 由于TP组关联，额外排除 {len(newly_excluded)} 个worker: {sorted(newly_excluded)}")
+                
+                # 重新计算alive_workers
+                alive_workers = []
+                alive_worker_names = []
+                for i, worker in enumerate(self.actor_rollout_wg._workers):
+                    if i not in associated_dead_workers:
+                        alive_workers.append(worker)
+                        if i < len(worker_names):
+                            alive_worker_names.append(worker_names[i])
+        except Exception as e:
+            print(f"[WARN] 检测TP/DP组关联worker时出错: {e}")
+            import traceback
+            traceback.print_exc()
+            # 如果检测失败，继续使用原来的alive_workers
         
         # 在TP/DP配置下，如果一张卡上的worker死了，同卡上的其他worker可能也无法正常工作
         # 但这里我们先尝试使用活着的worker继续，让后续的generate_sequences来验证
@@ -1442,8 +1845,38 @@ class RayPPOTrainer:
                             traceback.print_exc()
                     else:
                         print("[WARN] generate_sequences 方法没有 @register 装饰器")
+                        # 如果原worker group有这个方法，尝试直接使用（作为备选方案）
+                        if hasattr(self.actor_rollout_wg, 'generate_sequences'):
+                            try:
+                                original_method = getattr(self.actor_rollout_wg, 'generate_sequences')
+                                # 注意：由于func_generator生成的函数在闭包中捕获了原worker group的self，
+                                # 直接调用会使用原worker group的workers（可能包含死掉的workers）
+                                # 但作为备选方案，我们仍然尝试使用它
+                                def wrapped_generate_sequences(*args, **kwargs):
+                                    return original_method(*args, **kwargs)
+                                setattr(temp_wg, 'generate_sequences', wrapped_generate_sequences)
+                                print("[INFO] ✓ 从原worker group包装 generate_sequences 方法（备选方案：会使用原worker group的workers）")
+                            except Exception as e:
+                                print(f"[ERROR] 从原worker group包装 generate_sequences 失败: {e}")
+                                import traceback
+                                traceback.print_exc()
                 else:
                     print("[ERROR] 原始类没有 generate_sequences 方法")
+                    # 如果原worker group有这个方法，尝试直接使用（作为备选方案）
+                    if hasattr(self.actor_rollout_wg, 'generate_sequences'):
+                        try:
+                            original_method = getattr(self.actor_rollout_wg, 'generate_sequences')
+                            # 注意：由于func_generator生成的函数在闭包中捕获了原worker group的self，
+                            # 直接调用会使用原worker group的workers（可能包含死掉的workers）
+                            # 但作为备选方案，我们仍然尝试使用它
+                            def wrapped_generate_sequences(*args, **kwargs):
+                                return original_method(*args, **kwargs)
+                            setattr(temp_wg, 'generate_sequences', wrapped_generate_sequences)
+                            print("[INFO] ✓ 从原worker group包装 generate_sequences 方法（备选方案：会使用原worker group的workers，原始类无此方法）")
+                        except Exception as e:
+                            print(f"[ERROR] 从原worker group包装 generate_sequences 失败: {e}")
+                            import traceback
+                            traceback.print_exc()
             else:
                 print("[INFO] ✓ generate_sequences 方法绑定成功")
 
@@ -1744,14 +2177,32 @@ class RayPPOTrainer:
                                     breakpoint()
                                     alive_wg, all_dead = self._get_alive_worker_group()
                                     
-                                    # 如果所有worker都死了，需要完全恢复worker group
+                                    # 新的策略：即使所有worker都死了，也不立即重拉group
+                                    # 而是先尝试使用活着的worker继续推理，等推理全部完成后再重拉group
                                     if all_dead:
-                                        print("[ERROR] All workers are dead, attempting full recovery...")
-                                        self._recover_actor_rollout_ref_wg()
-                                        alive_wg = None  # 恢复后使用新的worker group
+                                        print("[ERROR] All workers are dead!")
+                                        print("[INFO] 将标记需要重拉group，但先尝试使用临时worker group继续推理")
+                                        print("[INFO] 等推理全部完成后，再进行group重拉")
+                                        # 标记需要重拉group，但不立即执行
+                                        self._need_recover_group = True
+                                        # 如果没有活着的worker，无法继续推理，抛出异常
+                                        if alive_wg is None:
+                                            raise RuntimeError(
+                                                "所有worker都死了，且无法创建临时worker group。"
+                                                "请检查是否有其他可用的推理实例。"
+                                            )
                                     
                                     # 使用活着的worker group（如果所有worker都活着，alive_wg为None，使用原worker group）
-                                    worker_group_to_use = alive_wg if alive_wg is not None else self.actor_rollout_wg
+                                    if alive_wg is not None:
+                                        # 使用临时worker group
+                                        self._temp_worker_group = alive_wg
+                                        self._using_temp_worker_group = True
+                                        worker_group_to_use = alive_wg
+                                        print(f"[INFO] 使用临时worker group继续推理（包含 {len(alive_wg._workers)} 个活着的worker）")
+                                    else:
+                                        # 所有worker都活着，使用原worker group
+                                        worker_group_to_use = self.actor_rollout_wg
+                                        self._using_temp_worker_group = False
                                     
                                     # 从队列中获取已生成的tokens并更新gen_batch_output
                                     _update_gen_batch_with_partial_tokens(gen_batch_output)
@@ -1796,20 +2247,40 @@ class RayPPOTrainer:
                                     if self.thread_flag:
                                         thread = threading.Thread(target=self.modify_json_file)
                                         thread.start()
-                                    gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
+                                    # 使用当前应该使用的worker group（可能是临时worker group）
+                                    current_wg = self._get_current_worker_group()
+                                    gen_batch_output = current_wg.generate_sequences(gen_batch_output)
                                 except Exception as e:
                                     print(f"[WARN] Worker failure detected during generate_sequences: {e}")
                                     # 检测活着的worker并创建临时worker group
                                     alive_wg, all_dead = self._get_alive_worker_group()
                                     
-                                    # 如果所有worker都死了，需要完全恢复worker group
+                                    # 新的策略：即使所有worker都死了，也不立即重拉group
+                                    # 而是先尝试使用活着的worker继续推理，等推理全部完成后再重拉group
                                     if all_dead:
-                                        print("[ERROR] All workers are dead, attempting full recovery...")
-                                        self._recover_actor_rollout_ref_wg()
-                                        alive_wg = None  # 恢复后使用新的worker group
+                                        print("[ERROR] All workers are dead!")
+                                        print("[INFO] 将标记需要重拉group，但先尝试使用临时worker group继续推理")
+                                        print("[INFO] 等推理全部完成后，再进行group重拉")
+                                        # 标记需要重拉group，但不立即执行
+                                        self._need_recover_group = True
+                                        # 如果没有活着的worker，无法继续推理，抛出异常
+                                        if alive_wg is None:
+                                            raise RuntimeError(
+                                                "所有worker都死了，且无法创建临时worker group。"
+                                                "请检查是否有其他可用的推理实例。"
+                                            )
                                     
                                     # 使用活着的worker group（如果所有worker都活着，alive_wg为None，使用原worker group）
-                                    worker_group_to_use = alive_wg if alive_wg is not None else self.actor_rollout_wg
+                                    if alive_wg is not None:
+                                        # 使用临时worker group
+                                        self._temp_worker_group = alive_wg
+                                        self._using_temp_worker_group = True
+                                        worker_group_to_use = alive_wg
+                                        print(f"[INFO] 使用临时worker group继续推理（包含 {len(alive_wg._workers)} 个活着的worker）")
+                                    else:
+                                        # 所有worker都活着，使用原worker group
+                                        worker_group_to_use = self.actor_rollout_wg
+                                        self._using_temp_worker_group = False
                                     
                                     # 从队列中获取已生成的tokens并更新gen_batch_output
                                     _update_gen_batch_with_partial_tokens(gen_batch_output)
@@ -1821,10 +2292,6 @@ class RayPPOTrainer:
                                     gen_batch_output.non_tensor_batch["per_request_generated_tokens"] = np.zeros_like(
                                         gen_batch_output.non_tensor_batch["per_request_generated_tokens"]
                                     )
-                                    
-                                    # 如果使用了临时worker group，可以选择是否完全恢复worker group
-                                    # 这里暂时不恢复，让后续的调用继续使用临时worker group
-                                    # 如果需要完全恢复，可以调用 self._recover_actor_rollout_ref_wg()
                                 finally:
                                     self._reset_tokens_queue()
                         else:
@@ -1832,6 +2299,23 @@ class RayPPOTrainer:
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
+                        
+                        # 推理完成后，检查是否需要重拉group
+                        if self._need_recover_group:
+                            print("[INFO] 推理已完成，开始重拉worker group...")
+                            try:
+                                self._recover_actor_rollout_ref_wg()
+                                # 重拉成功后，重置标记并切换到新的worker group
+                                self._need_recover_group = False
+                                self._using_temp_worker_group = False
+                                self._temp_worker_group = None
+                                print("[INFO] ✓ Worker group重拉成功，已切换到新的worker group")
+                            except Exception as e:
+                                print(f"[ERROR] Worker group重拉失败: {e}")
+                                import traceback
+                                traceback.print_exc()
+                                # 如果重拉失败，继续使用临时worker group
+                                print("[WARN] 将继续使用临时worker group，下次iteration再尝试重拉")
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
@@ -1841,7 +2325,9 @@ class RayPPOTrainer:
                             gen_baseline_batch = deepcopy(gen_batch)
                             gen_baseline_batch.meta_info["do_sample"] = False
                             if not self.async_rollout_mode:
-                                gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
+                                # 使用当前应该使用的worker group（可能是临时worker group）
+                                current_wg = self._get_current_worker_group()
+                                gen_baseline_output = current_wg.generate_sequences(gen_baseline_batch)
                             else:
                                 gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
                             batch = batch.union(gen_baseline_output)
