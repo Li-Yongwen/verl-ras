@@ -1385,8 +1385,7 @@ class RayPPOTrainer:
         # 绑定worker方法（从原worker group复制）
         original_ray_cls_with_init = getattr(self.actor_rollout_wg, 'ray_cls_with_init', None)
         if original_ray_cls_with_init is not None:
-            from verl.single_controller.ray.base import _unwrap_ray_remote
-            from verl.single_controller.base.decorator import func_generator
+            from verl.single_controller.ray.base import _unwrap_ray_remote, func_generator
             original_cls = _unwrap_ray_remote(original_ray_cls_with_init.cls)
             
             # 绑定方法
@@ -1447,7 +1446,7 @@ class RayPPOTrainer:
             
             temp_wg.ray_cls_with_init = original_ray_cls_with_init
         
-        # 最终验证：确保 generate_sequences 方法存在
+        # 最终验证：确保 generate_sequences 方法存在且可调用
         if not hasattr(temp_wg, 'generate_sequences'):
             raise AttributeError(
                 f"临时worker group缺少 generate_sequences 方法！"
@@ -1455,7 +1454,13 @@ class RayPPOTrainer:
                 f"原worker group有方法: {hasattr(self.actor_rollout_wg, 'generate_sequences')}"
             )
         
-        print("[INFO] ✓ 临时worker group重建成功，generate_sequences 方法可用")
+        # 验证方法是否可调用
+        if not callable(getattr(temp_wg, 'generate_sequences', None)):
+            raise AttributeError(
+                f"临时worker group的 generate_sequences 方法不可调用！"
+            )
+        
+        print("[INFO] ✓ 临时worker group重建成功，generate_sequences 方法可用且可调用")
         return temp_wg
     
     def _get_current_worker_group(self):
