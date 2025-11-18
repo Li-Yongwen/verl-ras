@@ -1935,6 +1935,48 @@ class RayPPOTrainer:
         # 绑定worker方法（从原worker group复制）
         # 如果原worker group有ray_cls_with_init，使用它来绑定方法
         original_ray_cls_with_init = getattr(self.actor_rollout_wg, 'ray_cls_with_init', None)
+        
+        # 如果ray_cls_with_init为None，尝试从其他地方获取
+        if original_ray_cls_with_init is None:
+            print("[WARN] actor_rollout_wg的ray_cls_with_init为None")
+            # 如果ray_cls_with_init为None，但actor_rollout_wg已有generate_sequences方法
+            # 我们可以通过创建一个包装函数来使用临时worker group的workers
+            if hasattr(self.actor_rollout_wg, 'generate_sequences'):
+                print("[INFO] actor_rollout_wg已有generate_sequences方法，创建包装函数")
+                try:
+                    original_method = getattr(self.actor_rollout_wg, 'generate_sequences')
+                    
+                    # 创建一个新的方法，使用临时worker group
+                    # 注意：我们需要创建一个新的Functor实例，使用temp_wg作为self
+                    # 但是，由于func_generator创建的方法会捕获self，我们需要通过闭包来访问
+                    def wrapped_generate_sequences(*args, **kwargs):
+                        # 保存原始workers
+                        original_workers = self.actor_rollout_wg._workers
+                        original_world_size = self.actor_rollout_wg._world_size
+                        try:
+                            # 临时替换为临时worker group的workers
+                            self.actor_rollout_wg._workers = temp_wg._workers
+                            self.actor_rollout_wg._world_size = temp_wg._world_size
+                            # 调用原方法（它会使用self.actor_rollout_wg._workers）
+                            return original_method(*args, **kwargs)
+                        finally:
+                            # 恢复原始workers
+                            self.actor_rollout_wg._workers = original_workers
+                            self.actor_rollout_wg._world_size = original_world_size
+                    
+                    setattr(temp_wg, 'generate_sequences', wrapped_generate_sequences)
+                    print("[INFO] ✓ 已通过包装函数的方式绑定generate_sequences")
+                except Exception as e:
+                    print(f"[ERROR] 创建包装函数失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    raise AttributeError(f"无法为临时worker group创建generate_sequences方法: {e}") from e
+            else:
+                raise AttributeError(
+                    "actor_rollout_wg的ray_cls_with_init为None，且没有已绑定的generate_sequences方法。"
+                    "无法创建临时worker group。"
+                )
+        
         if original_ray_cls_with_init is not None:
             # 解包Ray remote类，获取原始类
             from verl.single_controller.ray.base import _unwrap_ray_remote

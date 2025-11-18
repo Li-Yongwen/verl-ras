@@ -97,6 +97,42 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+def check_process_group_health(timeout=5.0):
+    """
+    检查分布式进程组是否健康。
+    
+    通过尝试一个轻量级的barrier操作来检测是否有进程挂掉。
+    如果进程组不健康，会抛出RuntimeError。
+    
+    Args:
+        timeout (float): 超时时间（秒）
+        
+    Raises:
+        RuntimeError: 如果检测到进程组不健康或进程挂掉
+    """
+    if not torch.distributed.is_initialized():
+        return True
+    
+    try:
+        # 尝试一个轻量级的barrier操作来检测进程组健康状态
+        # 如果任何进程挂掉，这个操作会失败
+        torch.distributed.barrier(timeout=datetime.timedelta(seconds=timeout))
+        return True
+    except RuntimeError as e:
+        error_msg = str(e).lower()
+        # 检查是否是进程挂掉相关的错误
+        if any(keyword in error_msg for keyword in ['timeout', 'process', 'rank', 'failed', 'dead']):
+            logger.error(f"检测到进程组不健康: {e}")
+            raise RuntimeError(
+                f"检测到分布式进程组中有进程挂掉。"
+                f"这通常发生在NPU/GPU进程异常退出后。"
+                f"请检查所有进程是否正常运行。"
+                f"原始错误: {e}"
+            ) from e
+        # 其他类型的RuntimeError也重新抛出
+        raise
+
+
 def create_device_mesh(world_size, fsdp_size):
     if fsdp_size < 0 or fsdp_size >= world_size:
         device_mesh = init_device_mesh(device_name, mesh_shape=(world_size,), mesh_dim_names=["fsdp"])
@@ -731,19 +767,74 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
         log_gpu_memory_usage("After load_fsdp_model_to_gpu", logger=logger)
 
+        # 清理 FSDP 的 unshard 上下文，避免 state_dict() 调用时的断言错误
+        # 这通常发生在 worker 恢复或重建后，FSDP 模块可能处于不一致的状态
+        try:
+            fsdp_ver = fsdp_version(self.actor_module_fsdp)
+            if fsdp_ver == 1:
+                # FSDP v1: 显式 reshard 以清理 unshard 上下文
+                if hasattr(self.actor_module_fsdp, '_handle'):
+                    self.actor_module_fsdp._handle.reshard(True)
+            elif fsdp_ver == 2:
+                # FSDP v2: 显式 reshard 以清理 unshard 上下文
+                if hasattr(self.actor_module_fsdp, 'reshard'):
+                    self.actor_module_fsdp.reshard()
+        except Exception as e:
+            logger.warning(f"清理 FSDP unshard 上下文时出错（可能不是问题）: {e}")
+
+        # 在调用state_dict()之前，检查进程组是否健康
+        # 如果NPU进程挂掉，state_dict()会触发HcclAllGather操作并失败
+        try:
+            check_process_group_health(timeout=5.0)
+        except RuntimeError as e:
+            logger.error(f"进程组健康检查失败，无法继续执行generate_sequences: {e}")
+            raise RuntimeError(
+                f"在generate_sequences时检测到进程组不健康。"
+                f"这通常是因为某个NPU/GPU进程已经挂掉。"
+                f"请检查所有进程是否正常运行，或考虑重启训练。"
+                f"原始错误: {e}"
+            ) from e
+
         peft_config = None
         peft_model = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
         if hasattr(peft_model, "peft_config"):  # LoRA
             peft_config = peft_model.peft_config.get("default", None)
-            params = collect_lora_params(
-                module=self.actor_module_fsdp,
-                layered_summon=self.config.rollout.get("layered_summon", False),
-                base_sync_done=self.base_sync_done,
-            )
-            if not self.base_sync_done:
-                params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
+            try:
+                params = collect_lora_params(
+                    module=self.actor_module_fsdp,
+                    layered_summon=self.config.rollout.get("layered_summon", False),
+                    base_sync_done=self.base_sync_done,
+                )
+                if not self.base_sync_done:
+                    params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
+            except RuntimeError as e:
+                error_msg = str(e).lower()
+                # 检查是否是NPU相关的错误（HcclAllGather等）
+                if any(keyword in error_msg for keyword in ['hccl', 'allgather', 'process exits', 'transport init']):
+                    logger.error(f"在collect_lora_params时检测到NPU进程挂掉: {e}")
+                    raise RuntimeError(
+                        f"在collect_lora_params时检测到NPU进程挂掉。"
+                        f"这通常发生在某个NPU进程异常退出后，FSDP尝试同步参数时失败。"
+                        f"请检查所有NPU进程是否正常运行，或考虑重启训练。"
+                        f"原始错误: {e}"
+                    ) from e
+                raise
         else:
-            params = self.actor_module_fsdp.state_dict()
+            try:
+                params = self.actor_module_fsdp.state_dict()
+            except RuntimeError as e:
+                error_msg = str(e).lower()
+                # 检查是否是NPU相关的错误（HcclAllGather等）
+                if any(keyword in error_msg for keyword in ['hccl', 'allgather', 'process exits', 'transport init', 'synchronize']):
+                    logger.error(f"在state_dict()时检测到NPU进程挂掉: {e}")
+                    raise RuntimeError(
+                        f"在state_dict()时检测到NPU进程挂掉。"
+                        f"这通常发生在某个NPU进程异常退出后，FSDP尝试同步参数时失败。"
+                        f"错误发生在HcclAllGather操作中，这表明分布式通信失败。"
+                        f"请检查所有NPU进程是否正常运行，或考虑重启训练。"
+                        f"原始错误: {e}"
+                    ) from e
+                raise
 
         params = convert_weight_keys(
             params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
