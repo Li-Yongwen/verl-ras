@@ -1690,17 +1690,8 @@ class RayPPOTrainer:
             is_functional = True
             node_id = None
             try:
+                # 使用actor方法尝试获取worker的node_id和device_id以判定可用性
                 import ray
-                # 方式1：如果worker有get_node_id方法，直接调用
-                if hasattr(worker, 'get_node_id'):
-                    try:
-                        node_id_future = worker.get_node_id.remote()
-                        node_id = ray.get(node_id_future, timeout=2.0)
-                        print(f"[INFO] Worker {i} 在节点 {node_id} 上，状态正常")
-                    except Exception as e:
-                        print(f"[WARN] Worker {i} 调用get_node_id失败: {e}")
-                
-                # 方式2：使用__ray_call__调用ray.get_runtime_context().get_node_id()
                 if node_id is None and hasattr(worker, '__ray_call__'):
                     try:
                         node_id_future = worker.__ray_call__.remote(lambda self: ray.get_runtime_context().get_node_id())
@@ -1708,20 +1699,6 @@ class RayPPOTrainer:
                         print(f"[INFO] Worker {i} 在节点 {node_id} 上，状态正常")
                     except Exception as e:
                         print(f"[WARN] Worker {i} 调用__ray_call__失败: {e}")
-                
-                # 方式3：从Ray actor信息中获取节点ID
-                if node_id is None:
-                    try:
-                        from ray.experimental.state.api import get_actor
-                        worker_state_dict = get_actor(worker._actor_id.hex())
-                        if worker_state_dict is not None:
-                            # 从actor信息中获取节点ID
-                            node_id = worker_state_dict.get("address", {}).get("nodeId") or worker_state_dict.get("node_id")
-                            if node_id:
-                                print(f"[INFO] Worker {i} 在节点 {node_id} 上（从actor信息获取），状态正常")
-                    except Exception as e:
-                        print(f"[WARN] Worker {i} 从actor信息获取节点ID失败: {e}")
-                
                 # 如果所有方式都失败，标记为不可用
                 if node_id is None:
                     print(f"[WARN] Worker {i} Ray actor显示ALIVE但无法验证其可用性")
@@ -1743,17 +1720,22 @@ class RayPPOTrainer:
         if dead_worker_indices:
             print(f"[WARN] 发现 {len(dead_worker_indices)} 个不可用的worker: {dead_worker_indices}")
         
-        # 第三步：按节点/卡分组检测，避免将已死卡上的worker包含进来
-        # 如果一张卡上的进程被杀，同卡上的其他worker可能也会受影响
-        worker_node_map = {}  # node_id -> [worker_indices]
-        worker_node_id_map = {}  # worker_index -> node_id
+        # 第三步：按节点/设备分组检测，避免将已死设备上的worker包含进来
+        # 如果一张卡/一个NPU上的进程被杀，同设备上的其他worker可能也会受影响
+        # 使用 (node_id, device_id) 作为唯一标识，以区分同一节点上的不同设备
+        worker_node_device_map = {}  # (node_id, device_id) -> [worker_indices]
+        worker_node_device_id_map = {}  # worker_index -> (node_id, device_id)
         
-        # 收集所有活着的worker的节点信息
+        # 收集所有活着的worker的节点和设备信息
         for i, worker in enumerate(self.actor_rollout_wg._workers):
             if i not in dead_worker_indices:
                 node_id = None
+                device_id = None
                 try:
                     import ray
+                    import os
+                    
+                    # 获取节点ID
                     # 方式1：如果worker有get_node_id方法，直接调用
                     if hasattr(worker, 'get_node_id'):
                         try:
@@ -1781,33 +1763,80 @@ class RayPPOTrainer:
                         except:
                             pass
                     
+                    # 获取设备ID（NPU/GPU ID）
+                    # 方式1：使用__ray_call__获取LOCAL_RANK或CUDA_VISIBLE_DEVICES
+                    if hasattr(worker, '__ray_call__'):
+                        try:
+                            # 尝试获取LOCAL_RANK和CUDA_VISIBLE_DEVICES/ASCEND_RT_VISIBLE_DEVICES
+                            device_info_future = worker.__ray_call__.remote(
+                                lambda self: (
+                                    os.environ.get("LOCAL_RANK", "-1"),
+                                    os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+                                    os.environ.get("ASCEND_RT_VISIBLE_DEVICES", ""),
+                                )
+                            )
+                            local_rank, cuda_visible, ascend_visible = ray.get(device_info_future, timeout=1.0)
+                            
+                            # 优先使用LOCAL_RANK，如果没有则使用VISIBLE_DEVICES的第一个值
+                            if local_rank != "-1" and local_rank:
+                                device_id = f"local_rank_{local_rank}"
+                            elif cuda_visible:
+                                # CUDA_VISIBLE_DEVICES可能是逗号分隔的列表，取第一个
+                                device_id = f"cuda_{cuda_visible.split(',')[0]}"
+                            elif ascend_visible:
+                                # ASCEND_RT_VISIBLE_DEVICES可能是逗号分隔的列表，取第一个
+                                device_id = f"ascend_{ascend_visible.split(',')[0]}"
+                        except:
+                            pass
+                    
+                    # 方式2：尝试从Ray的accelerator_ids获取
+                    if device_id is None and hasattr(worker, '__ray_call__'):
+                        try:
+                            from verl.utils.device import get_device_name
+                            device_name = get_device_name()  # "NPU" or "GPU"
+                            accelerator_info_future = worker.__ray_call__.remote(
+                                lambda self: ray.get_runtime_context().get_accelerator_ids()
+                            )
+                            accelerator_ids = ray.get(accelerator_info_future, timeout=1.0)
+                            if device_name in accelerator_ids and accelerator_ids[device_name]:
+                                device_id = f"{device_name.lower()}_{accelerator_ids[device_name][0]}"
+                        except:
+                            pass
+                    
+                    # 如果无法获取设备ID，使用worker索引作为fallback
+                    if device_id is None:
+                        device_id = f"worker_{i}"
+                        print(f"[WARN] 无法获取worker {i}的设备ID，使用worker索引作为fallback: {device_id}")
+                    
                     if node_id is not None:
-                        if node_id not in worker_node_map:
-                            worker_node_map[node_id] = []
-                        worker_node_map[node_id].append(i)
-                        worker_node_id_map[i] = node_id
+                        node_device_key = (node_id, device_id)
+                        if node_device_key not in worker_node_device_map:
+                            worker_node_device_map[node_device_key] = []
+                        worker_node_device_map[node_device_key].append(i)
+                        worker_node_device_id_map[i] = node_device_key
+                        print(f"[INFO] Worker {i} 在节点 {node_id} 设备 {device_id} 上")
                     else:
-                        print(f"[WARN] 无法获取worker {i}的节点信息，将跳过节点分组检测")
+                        print(f"[WARN] 无法获取worker {i}的节点信息，将跳过节点/设备分组检测")
                 except Exception as e:
-                    print(f"[WARN] 获取worker {i}的节点信息时出错: {e}")
+                    print(f"[WARN] 获取worker {i}的节点/设备信息时出错: {e}")
         
-        # 收集所有节点的信息
-        all_worker_nodes = list(worker_node_map.keys())
+        # 收集所有节点/设备的组合信息
+        all_worker_node_devices = list(worker_node_device_map.keys())
         original_total_workers = len(self.actor_rollout_wg._workers)
         
-        # 检查每个节点上的worker存活情况
-        nodes_with_dead_workers = []
-        for node_id in all_worker_nodes:
-            node_workers = [i for i in range(original_total_workers) if worker_node_id_map.get(i) == node_id]
-            node_alive_workers = [i for i in node_workers if i not in dead_worker_indices]
-            if len(node_alive_workers) < len(node_workers):
-                nodes_with_dead_workers.append((node_id, len(node_alive_workers), len(node_workers)))
-                print(f"[WARN] 节点 {node_id} 上有 {len(node_workers) - len(node_alive_workers)}/{len(node_workers)} 个worker死亡")
+        # 检查每个节点/设备组合上的worker存活情况
+        node_devices_with_dead_workers = []
+        for (node_id, device_id) in all_worker_node_devices:
+            node_device_workers = [i for i in range(original_total_workers) if worker_node_device_id_map.get(i) == (node_id, device_id)]
+            node_device_alive_workers = [i for i in node_device_workers if i not in dead_worker_indices]
+            if len(node_device_alive_workers) < len(node_device_workers):
+                node_devices_with_dead_workers.append(((node_id, device_id), len(node_device_alive_workers), len(node_device_workers)))
+                print(f"[WARN] 节点 {node_id} 设备 {device_id} 上有 {len(node_device_workers) - len(node_device_alive_workers)}/{len(node_device_workers)} 个worker死亡")
         
-        # 如果某个节点上的所有worker都死了，给出警告
-        for node_id, alive_count, total_count in nodes_with_dead_workers:
+        # 如果某个节点/设备组合上的所有worker都死了，给出警告
+        for (node_id, device_id), alive_count, total_count in node_devices_with_dead_workers:
             if alive_count == 0:
-                print(f"[ERROR] 节点 {node_id} 上的所有 {total_count} 个worker都死了！")
+                print(f"[ERROR] 节点 {node_id} 设备 {device_id} 上的所有 {total_count} 个worker都死了！")
                 print(f"[ERROR] 这可能意味着该节点/卡上的进程被完全杀掉了")
         
         # 第四步：检测TP/DP组的关联worker
@@ -1815,24 +1844,21 @@ class RayPPOTrainer:
         # 因为TP组需要所有成员才能正常工作
         associated_dead_workers = set(dead_worker_indices)  # 需要排除的worker集合（包括直接死掉的+关联的）
         
-        # 尝试从worker获取TP/DP配置信息
-        # 通过查询worker的dispatch/collect信息来推断TP组
+        # 尝试从worker group获取TP/DP配置信息
+        # 注意：在colocated worker模式下，不应该直接查询单个worker的dispatch信息
+        # 因为WorkerDict本身不注册dispatch信息，而是通过内部的worker来管理
+        # 我们应该通过worker group的_query_dispatch_info方法来查询（如果可用）
+        # 或者直接使用配置信息
         try:
-            # 尝试从第一个活着的worker获取配置信息
-            if alive_workers:
-                test_worker = alive_workers[0]
-                # 尝试获取rollout mesh的dispatch信息
-                try:
-                    import ray
-                    # 查询worker的rollout dispatch信息（如果worker支持）
-                    # 这需要worker有_query_dispatch_info方法
-                    if hasattr(test_worker, '_query_dispatch_info'):
-                        # 获取rollout mesh的dispatch信息
-                        dispatch_info_future = test_worker._query_dispatch_info.remote("rollout")
-                        dispatch_info = ray.get(dispatch_info_future, timeout=2.0)
-                        print(f"[INFO] 获取到rollout dispatch信息: {dispatch_info}")
-                except Exception as e:
-                    print(f"[WARN] 无法获取worker的dispatch信息: {e}")
+            # 尝试从原worker group获取dispatch信息（如果已经缓存）
+            dp_rank_mapping = None
+            if hasattr(self, 'actor_rollout_wg') and self.actor_rollout_wg is not None:
+                # 检查是否已经有缓存的dispatch信息
+                if "rollout" in getattr(self.actor_rollout_wg, '_dispatch_info', {}):
+                    dp_rank_mapping = self.actor_rollout_wg._dispatch_info["rollout"]
+                    print(f"[INFO] 从原worker group缓存获取到dispatch信息: {dp_rank_mapping}")
+                # 如果原worker group还活着，尝试查询（但可能失败，因为worker已经死了）
+                # 这里我们跳过直接查询，因为部分worker可能已经死了
             
             # 尝试从config获取TP/DP信息（如果有的话）
             # 使用统一的_identify_associated_workers方法来识别关联worker
@@ -1912,7 +1938,36 @@ class RayPPOTrainer:
         if original_ray_cls_with_init is not None:
             # 解包Ray remote类，获取原始类
             from verl.single_controller.ray.base import _unwrap_ray_remote
-            original_cls = _unwrap_ray_remote(original_ray_cls_with_init.cls)
+            
+            # 检查是否是colocated worker模式（fused worker）
+            # 参考 spawn_fused 的实现方式
+            fused_worker_used = getattr(self.actor_rollout_wg, 'fused_worker_used', False)
+            
+            if fused_worker_used:
+                # Colocated worker模式：需要从raw_cls_dict中获取对应的类
+                # 参考 spawn_fused 方法：new_wg._bind_worker_method(self.ray_cls_with_init.cls.raw_cls_dict[key], func_generator)
+                print("[INFO] 检测到colocated worker模式，从raw_cls_dict获取类")
+                unwrapped_cls = _unwrap_ray_remote(original_ray_cls_with_init.cls)
+                
+                # 获取raw_cls_dict
+                if hasattr(unwrapped_cls, 'raw_cls_dict'):
+                    raw_cls_dict = unwrapped_cls.raw_cls_dict
+                elif hasattr(original_ray_cls_with_init.cls, 'raw_cls_dict'):
+                    raw_cls_dict = original_ray_cls_with_init.cls.raw_cls_dict
+                else:
+                    raise AttributeError("colocated worker模式下无法找到raw_cls_dict")
+                
+                # 使用Role.ActorRollout作为key来获取对应的类
+                actor_rollout_key = str(Role.ActorRollout)
+                if actor_rollout_key not in raw_cls_dict:
+                    raise AttributeError(f"在raw_cls_dict中找不到key: {actor_rollout_key}, 可用的keys: {list(raw_cls_dict.keys())}")
+                
+                original_cls = raw_cls_dict[actor_rollout_key]
+                print(f"[INFO] 从raw_cls_dict获取类: {original_cls} (key: {actor_rollout_key})")
+            else:
+                # 非colocated worker模式：直接使用解包后的类
+                original_cls = _unwrap_ray_remote(original_ray_cls_with_init.cls)
+                print(f"[INFO] 非colocated worker模式，使用解包后的类: {original_cls}")
             
             # 绑定方法
             print(f"[INFO] 绑定worker方法，原始类: {original_cls}")
@@ -1972,38 +2027,126 @@ class RayPPOTrainer:
                             traceback.print_exc()
                     else:
                         print("[WARN] generate_sequences 方法没有 @register 装饰器")
-                        # 如果原worker group有这个方法，尝试直接使用（作为备选方案）
-                        if hasattr(self.actor_rollout_wg, 'generate_sequences'):
-                            try:
-                                original_method = getattr(self.actor_rollout_wg, 'generate_sequences')
-                                # 注意：由于func_generator生成的函数在闭包中捕获了原worker group的self，
-                                # 直接调用会使用原worker group的workers（可能包含死掉的workers）
-                                # 但作为备选方案，我们仍然尝试使用它
-                                def wrapped_generate_sequences(*args, **kwargs):
-                                    return original_method(*args, **kwargs)
-                                setattr(temp_wg, 'generate_sequences', wrapped_generate_sequences)
-                                print("[INFO] ✓ 从原worker group包装 generate_sequences 方法（备选方案：会使用原worker group的workers）")
-                            except Exception as e:
-                                print(f"[ERROR] 从原worker group包装 generate_sequences 失败: {e}")
-                                import traceback
-                                traceback.print_exc()
+                        # 无法绑定方法，因为缺少@register装饰器
+                        print("[ERROR] 无法绑定 generate_sequences 方法：缺少 @register 装饰器")
                 else:
                     print("[ERROR] 原始类没有 generate_sequences 方法")
-                    # 如果原worker group有这个方法，尝试直接使用（作为备选方案）
+                    # 原始类没有generate_sequences方法，可能是colocated worker模式
+                    # 在这种情况下，需要检查原worker group是否有这个方法
                     if hasattr(self.actor_rollout_wg, 'generate_sequences'):
+                        print("[WARN] 原始类没有 generate_sequences 方法，但原worker group有")
+                        print("[WARN] 这可能是colocated worker模式，方法在WorkerDict中动态绑定")
+                        # 尝试从colocated worker的原始类中提取方法信息并动态绑定
                         try:
-                            original_method = getattr(self.actor_rollout_wg, 'generate_sequences')
-                            # 注意：由于func_generator生成的函数在闭包中捕获了原worker group的self，
-                            # 直接调用会使用原worker group的workers（可能包含死掉的workers）
-                            # 但作为备选方案，我们仍然尝试使用它
-                            def wrapped_generate_sequences(*args, **kwargs):
-                                return original_method(*args, **kwargs)
-                            setattr(temp_wg, 'generate_sequences', wrapped_generate_sequences)
-                            print("[INFO] ✓ 从原worker group包装 generate_sequences 方法（备选方案：会使用原worker group的workers，原始类无此方法）")
+                            # 尝试从ray_cls_with_init中获取原始类字典（colocated worker模式）
+                            ray_cls_with_init = getattr(self.actor_rollout_wg, 'ray_cls_with_init', None)
+                            if ray_cls_with_init is not None:
+                                # 检查是否是colocated worker模式（有raw_cls_dict属性）
+                                if hasattr(ray_cls_with_init, 'raw_cls_dict') or hasattr(ray_cls_with_init.cls, 'raw_cls_dict'):
+                                    print("[INFO] 检测到colocated worker模式，尝试从原始类中提取方法信息")
+                                    # 尝试从原始类字典中查找generate_sequences方法
+                                    found_method = None
+                                    found_cls_name = None
+                                    
+                                    # 方法1：从ray_cls_with_init.cls的raw_cls_dict获取
+                                    try:
+                                        if hasattr(ray_cls_with_init.cls, 'raw_cls_dict'):
+                                            raw_cls_dict = ray_cls_with_init.cls.raw_cls_dict
+                                            for cls_name, raw_cls in raw_cls_dict.items():
+                                                if hasattr(raw_cls, 'generate_sequences'):
+                                                    found_method = getattr(raw_cls, 'generate_sequences')
+                                                    found_cls_name = cls_name
+                                                    print(f"[INFO] 在colocated worker的 {cls_name} 类中找到 generate_sequences 方法")
+                                                    break
+                                    except:
+                                        pass
+                                    
+                                    # 方法2：从ray_cls_with_init的raw_cls_dict获取（如果存在）
+                                    if found_method is None:
+                                        try:
+                                            if hasattr(ray_cls_with_init, 'raw_cls_dict'):
+                                                raw_cls_dict = ray_cls_with_init.raw_cls_dict
+                                                for cls_name, raw_cls in raw_cls_dict.items():
+                                                    if hasattr(raw_cls, 'generate_sequences'):
+                                                        found_method = getattr(raw_cls, 'generate_sequences')
+                                                        found_cls_name = cls_name
+                                                        print(f"[INFO] 在colocated worker的 {cls_name} 类中找到 generate_sequences 方法")
+                                                        break
+                                        except:
+                                            pass
+                                    
+                                    # 如果找到了方法，尝试提取MAGIC_ATTR并重新绑定
+                                    if found_method is not None:
+                                        from verl.single_controller.base.decorator import MAGIC_ATTR
+                                        if hasattr(found_method, MAGIC_ATTR):
+                                            print(f"[INFO] 从 {found_cls_name} 类中提取 generate_sequences 方法的绑定信息")
+                                            attribute = getattr(found_method, MAGIC_ATTR)
+                                            dispatch_mode = attribute["dispatch_mode"]
+                                            execute_mode = attribute["execute_mode"]
+                                            blocking = attribute["blocking"]
+                                            
+                                            # 获取 dispatch 和 collect 函数
+                                            from verl.single_controller.base.decorator import (
+                                                get_predefined_dispatch_fn,
+                                                get_predefined_execute_fn,
+                                                Dispatch,
+                                            )
+                                            if isinstance(dispatch_mode, Dispatch):
+                                                fn = get_predefined_dispatch_fn(dispatch_mode=dispatch_mode)
+                                                dispatch_fn = fn["dispatch_fn"]
+                                                collect_fn = fn["collect_fn"]
+                                            else:
+                                                dispatch_fn = dispatch_mode["dispatch_fn"]
+                                                collect_fn = dispatch_mode["collect_fn"]
+                                            
+                                            # 获取 execute 函数
+                                            execute_mode_dict = get_predefined_execute_fn(execute_mode=execute_mode)
+                                            wg_execute_fn_name = execute_mode_dict["execute_fn_name"]
+                                            execute_fn = getattr(temp_wg, wg_execute_fn_name)
+                                            
+                                            # 生成并绑定方法
+                                            func = func_generator(
+                                                temp_wg,
+                                                'generate_sequences',
+                                                dispatch_fn=dispatch_fn,
+                                                collect_fn=collect_fn,
+                                                execute_fn=execute_fn,
+                                                blocking=blocking,
+                                            )
+                                            setattr(temp_wg, 'generate_sequences', func)
+                                            print("[INFO] ✓ 为临时worker group动态绑定 generate_sequences 方法成功（从colocated worker提取）")
+                                        else:
+                                            raise AttributeError(
+                                                f"在 {found_cls_name} 类中找到 generate_sequences 方法，但缺少 @register 装饰器"
+                                            )
+                                    else:
+                                        raise AttributeError(
+                                            "无法在colocated worker的原始类中找到 generate_sequences 方法"
+                                        )
+                                else:
+                                    # 不是colocated worker模式，但原始类没有方法
+                                    raise AttributeError(
+                                        "原始类没有 generate_sequences 方法，且不是colocated worker模式"
+                                    )
+                            else:
+                                raise AttributeError(
+                                    "原worker group没有 ray_cls_with_init，无法提取方法信息"
+                                )
+                        except AttributeError as e:
+                            # 如果是我们抛出的AttributeError，直接重新抛出
+                            raise
                         except Exception as e:
-                            print(f"[ERROR] 从原worker group包装 generate_sequences 失败: {e}")
+                            print(f"[ERROR] 动态绑定 generate_sequences 失败: {e}")
                             import traceback
                             traceback.print_exc()
+                            raise AttributeError(
+                                f"无法为临时worker group动态绑定 generate_sequences 方法：{e}"
+                            ) from e
+                    else:
+                        raise AttributeError(
+                            "原始类没有 generate_sequences 方法，且原worker group也没有此方法。"
+                            "无法创建临时worker group。"
+                        )
             else:
                 print("[INFO] ✓ generate_sequences 方法绑定成功")
 
