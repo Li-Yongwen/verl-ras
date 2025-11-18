@@ -1525,11 +1525,43 @@ class RayPPOTrainer:
             is_functional = True
             try:
                 import ray
-                node_id_future = worker.get_node_id.remote() if hasattr(worker, 'get_node_id') else None
-                if node_id_future is not None:
-                    node_id = ray.get(node_id_future, timeout=2.0)
+                # 尝试多种方式获取节点信息
+                node_id = None
+                
+                # 方式1：如果worker有get_node_id方法，直接调用
+                if hasattr(worker, 'get_node_id'):
+                    try:
+                        node_id_future = worker.get_node_id.remote()
+                        node_id = ray.get(node_id_future, timeout=2.0)
+                    except:
+                        pass
+                
+                # 方式2：使用__ray_call__调用ray.get_runtime_context().get_node_id()
+                if node_id is None and hasattr(worker, '__ray_call__'):
+                    try:
+                        node_id_future = worker.__ray_call__.remote(lambda self: ray.get_runtime_context().get_node_id())
+                        node_id = ray.get(node_id_future, timeout=2.0)
+                    except:
+                        pass
+                
+                # 方式3：从Ray actor信息中获取节点ID
+                if node_id is None:
+                    try:
+                        from ray.experimental.state.api import get_actor
+                        worker_state_dict = get_actor(worker._actor_id.hex())
+                        if worker_state_dict is not None:
+                            # 从actor信息中获取节点ID
+                            node_id = worker_state_dict.get("address", {}).get("nodeId") or worker_state_dict.get("node_id")
+                    except:
+                        pass
+                
+                if node_id is not None:
                     orig_idx = temp_to_original_index_map.get(temp_idx, temp_idx)
                     print(f"[INFO] 临时worker group中的worker {temp_idx} (原索引 {orig_idx}) 在节点 {node_id} 上，状态正常")
+                else:
+                    # 如果无法获取节点信息，但worker还活着，仍然认为它是可用的
+                    orig_idx = temp_to_original_index_map.get(temp_idx, temp_idx)
+                    print(f"[WARN] 无法获取临时worker {temp_idx} (原索引 {orig_idx}) 的节点信息，但worker状态正常")
             except Exception as e:
                 orig_idx = temp_to_original_index_map.get(temp_idx, temp_idx)
                 print(f"[WARN] 临时worker group中的worker {temp_idx} (原索引 {orig_idx}) Ray actor显示ALIVE但实际调用失败: {e}")
@@ -1563,14 +1595,46 @@ class RayPPOTrainer:
                 if is_alive:
                     try:
                         import ray
-                        node_id_future = worker.get_node_id.remote() if hasattr(worker, 'get_node_id') else None
-                        if node_id_future is not None:
-                            ray.get(node_id_future, timeout=1.0)
+                        # 尝试多种方式验证worker是否可用
+                        verified = False
+                        
+                        # 方式1：如果worker有get_node_id方法，调用它
+                        if hasattr(worker, 'get_node_id'):
+                            try:
+                                node_id_future = worker.get_node_id.remote()
+                                ray.get(node_id_future, timeout=1.0)
+                                verified = True
+                            except:
+                                pass
+                        
+                        # 方式2：使用__ray_call__调用ray.get_runtime_context().get_node_id()
+                        if not verified and hasattr(worker, '__ray_call__'):
+                            try:
+                                node_id_future = worker.__ray_call__.remote(lambda self: ray.get_runtime_context().get_node_id())
+                                ray.get(node_id_future, timeout=1.0)
+                                verified = True
+                            except:
+                                pass
+                        
+                        # 方式3：如果前两种方式都失败，但worker状态是ALIVE，仍然认为它是可用的
+                        if not verified:
+                            # 尝试从Ray actor信息中获取节点ID来验证
+                            try:
+                                from ray.experimental.state.api import get_actor
+                                worker_state_dict = get_actor(worker._actor_id.hex())
+                                if worker_state_dict is not None and worker_state_dict.get("state", "undefined") == "ALIVE":
+                                    verified = True
+                            except:
+                                pass
+                        
+                        if verified:
                             alive_workers.append(worker)
                             if i < len(original_worker_names):
                                 alive_worker_names.append(original_worker_names[i])
-                    except:
-                        print(f"[WARN] Worker {i} 验证失败，排除")
+                        else:
+                            print(f"[WARN] Worker {i} 验证失败，无法确认其可用性，排除")
+                    except Exception as e:
+                        print(f"[WARN] Worker {i} 验证失败: {e}，排除")
         
         if len(associated_dead_workers) > len(dead_worker_indices_in_temp):
             newly_excluded = associated_dead_workers - set(dead_worker_indices_in_temp)
@@ -1622,20 +1686,50 @@ class RayPPOTrainer:
                 continue
             
             # 第二步：尝试实际调用worker来验证是否真正可用
-            # 使用一个轻量级的方法调用来验证（如果worker有get_node_id方法）
+            # 使用多种方式验证worker是否可用
             is_functional = True
+            node_id = None
             try:
-                # 尝试获取worker的node_id，这是一个轻量级的调用
-                # 如果worker真的死了（比如GPU进程被杀），这个调用会失败
                 import ray
-                node_id_future = worker.get_node_id.remote() if hasattr(worker, 'get_node_id') else None
-                if node_id_future is not None:
-                    # 设置超时，避免长时间等待
-                    node_id = ray.get(node_id_future, timeout=2.0)
-                    print(f"[INFO] Worker {i} 在节点 {node_id} 上，状态正常")
+                # 方式1：如果worker有get_node_id方法，直接调用
+                if hasattr(worker, 'get_node_id'):
+                    try:
+                        node_id_future = worker.get_node_id.remote()
+                        node_id = ray.get(node_id_future, timeout=2.0)
+                        print(f"[INFO] Worker {i} 在节点 {node_id} 上，状态正常")
+                    except Exception as e:
+                        print(f"[WARN] Worker {i} 调用get_node_id失败: {e}")
+                
+                # 方式2：使用__ray_call__调用ray.get_runtime_context().get_node_id()
+                if node_id is None and hasattr(worker, '__ray_call__'):
+                    try:
+                        node_id_future = worker.__ray_call__.remote(lambda self: ray.get_runtime_context().get_node_id())
+                        node_id = ray.get(node_id_future, timeout=2.0)
+                        print(f"[INFO] Worker {i} 在节点 {node_id} 上，状态正常")
+                    except Exception as e:
+                        print(f"[WARN] Worker {i} 调用__ray_call__失败: {e}")
+                
+                # 方式3：从Ray actor信息中获取节点ID
+                if node_id is None:
+                    try:
+                        from ray.experimental.state.api import get_actor
+                        worker_state_dict = get_actor(worker._actor_id.hex())
+                        if worker_state_dict is not None:
+                            # 从actor信息中获取节点ID
+                            node_id = worker_state_dict.get("address", {}).get("nodeId") or worker_state_dict.get("node_id")
+                            if node_id:
+                                print(f"[INFO] Worker {i} 在节点 {node_id} 上（从actor信息获取），状态正常")
+                    except Exception as e:
+                        print(f"[WARN] Worker {i} 从actor信息获取节点ID失败: {e}")
+                
+                # 如果所有方式都失败，标记为不可用
+                if node_id is None:
+                    print(f"[WARN] Worker {i} Ray actor显示ALIVE但无法验证其可用性")
+                    print(f"[WARN] 可能是GPU进程被杀但Ray actor未更新状态，标记为不可用")
+                    is_functional = False
+                    dead_worker_indices.append(i)
             except Exception as e:
-                print(f"[WARN] Worker {i} Ray actor显示ALIVE但实际调用失败: {e}")
-                print(f"[WARN] 可能是GPU进程被杀但Ray actor未更新状态，标记为不可用")
+                print(f"[WARN] Worker {i} 验证过程出错: {e}")
                 is_functional = False
                 dead_worker_indices.append(i)
             
@@ -1657,17 +1751,45 @@ class RayPPOTrainer:
         # 收集所有活着的worker的节点信息
         for i, worker in enumerate(self.actor_rollout_wg._workers):
             if i not in dead_worker_indices:
+                node_id = None
                 try:
                     import ray
-                    node_id_future = worker.get_node_id.remote() if hasattr(worker, 'get_node_id') else None
-                    if node_id_future is not None:
-                        node_id = ray.get(node_id_future, timeout=1.0)
+                    # 方式1：如果worker有get_node_id方法，直接调用
+                    if hasattr(worker, 'get_node_id'):
+                        try:
+                            node_id_future = worker.get_node_id.remote()
+                            node_id = ray.get(node_id_future, timeout=1.0)
+                        except:
+                            pass
+                    
+                    # 方式2：使用__ray_call__调用ray.get_runtime_context().get_node_id()
+                    if node_id is None and hasattr(worker, '__ray_call__'):
+                        try:
+                            node_id_future = worker.__ray_call__.remote(lambda self: ray.get_runtime_context().get_node_id())
+                            node_id = ray.get(node_id_future, timeout=1.0)
+                        except:
+                            pass
+                    
+                    # 方式3：从Ray actor信息中获取节点ID
+                    if node_id is None:
+                        try:
+                            from ray.experimental.state.api import get_actor
+                            worker_state_dict = get_actor(worker._actor_id.hex())
+                            if worker_state_dict is not None:
+                                # 从actor信息中获取节点ID
+                                node_id = worker_state_dict.get("address", {}).get("nodeId") or worker_state_dict.get("node_id")
+                        except:
+                            pass
+                    
+                    if node_id is not None:
                         if node_id not in worker_node_map:
                             worker_node_map[node_id] = []
                         worker_node_map[node_id].append(i)
                         worker_node_id_map[i] = node_id
+                    else:
+                        print(f"[WARN] 无法获取worker {i}的节点信息，将跳过节点分组检测")
                 except Exception as e:
-                    print(f"[WARN] 无法获取worker {i}的节点信息: {e}")
+                    print(f"[WARN] 获取worker {i}的节点信息时出错: {e}")
         
         # 收集所有节点的信息
         all_worker_nodes = list(worker_node_map.keys())
