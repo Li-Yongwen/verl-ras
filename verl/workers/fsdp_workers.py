@@ -133,6 +133,82 @@ def check_process_group_health(timeout=5.0):
         raise
 
 
+def check_fsdp_process_group_alignment(expected_world_size=None):
+    """
+    检查FSDP进程组是否与当前worker group对齐。
+    
+    当创建新的worker group（只包含活着的worker）后，FSDP进程组可能仍然指向旧的进程组。
+    这会导致allgather操作失败，因为FSDP尝试与已死的进程通信。
+    
+    Args:
+        expected_world_size (int, optional): 期望的进程组大小（通常是新worker group的worker数量）
+        
+    Returns:
+        dict: 包含进程组信息的字典，包括：
+            - fsdp_world_size: FSDP进程组的world_size
+            - fsdp_rank: 当前进程的rank
+            - env_world_size: 环境变量WORLD_SIZE的值
+            - env_rank: 环境变量RANK的值
+            - expected_world_size: 期望的world_size（如果提供）
+            - is_aligned: 是否对齐（如果提供了expected_world_size）
+            
+    Raises:
+        RuntimeError: 如果检测到进程组不匹配
+    """
+    if not torch.distributed.is_initialized():
+        return {
+            "fsdp_world_size": None,
+            "fsdp_rank": None,
+            "env_world_size": int(os.environ.get("WORLD_SIZE", 0)),
+            "env_rank": int(os.environ.get("RANK", 0)),
+            "expected_world_size": expected_world_size,
+            "is_aligned": True if expected_world_size is None else False,
+        }
+    
+    fsdp_world_size = torch.distributed.get_world_size()
+    fsdp_rank = torch.distributed.get_rank()
+    env_world_size = int(os.environ.get("WORLD_SIZE", 0))
+    env_rank = int(os.environ.get("RANK", 0))
+    
+    info = {
+        "fsdp_world_size": fsdp_world_size,
+        "fsdp_rank": fsdp_rank,
+        "env_world_size": env_world_size,
+        "env_rank": env_rank,
+        "expected_world_size": expected_world_size,
+        "is_aligned": True,
+    }
+    
+    # 如果提供了期望的world_size，检查是否匹配
+    if expected_world_size is not None:
+        if fsdp_world_size != expected_world_size:
+            info["is_aligned"] = False
+            logger.error(
+                f"FSDP进程组与worker group不匹配！"
+                f"FSDP进程组world_size={fsdp_world_size}, "
+                f"期望的world_size={expected_world_size}, "
+                f"环境变量WORLD_SIZE={env_world_size}, "
+                f"当前rank={fsdp_rank}"
+            )
+            raise RuntimeError(
+                f"FSDP进程组与新的worker group不匹配！\n"
+                f"  - FSDP进程组world_size: {fsdp_world_size}（这是旧的进程组大小）\n"
+                f"  - 新worker group的worker数量: {expected_world_size}\n"
+                f"  - 环境变量WORLD_SIZE: {env_world_size}\n"
+                f"  - 当前进程rank: {fsdp_rank}\n\n"
+                f"问题分析：\n"
+                f"  当创建新的worker group（只包含活着的worker）后，FSDP进程组仍然指向旧的进程组。\n"
+                f"  allgather操作会尝试与旧的进程组（包括已死的进程）通信，导致失败。\n\n"
+                f"解决方案：\n"
+                f"  1. 需要重新初始化FSDP进程组以匹配新的worker group\n"
+                f"  2. 或者，确保所有worker都使用相同的进程组配置\n"
+                f"  3. 查看allgather范围：FSDP进程组包含 {fsdp_world_size} 个进程（rank 0-{fsdp_world_size-1}）\n"
+                f"     但新的worker group只有 {expected_world_size} 个worker"
+            )
+    
+    return info
+
+
 def create_device_mesh(world_size, fsdp_size):
     if fsdp_size < 0 or fsdp_size >= world_size:
         device_mesh = init_device_mesh(device_name, mesh_shape=(world_size,), mesh_dim_names=["fsdp"])
@@ -784,14 +860,50 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 在调用state_dict()之前，检查进程组是否健康
         # 如果NPU进程挂掉，state_dict()会触发HcclAllGather操作并失败
+        # 同时记录FSDP进程组信息，用于诊断allgather范围
+        pg_info = None
         try:
+            # 记录FSDP进程组信息（不抛出异常，仅用于诊断）
+            pg_info = check_fsdp_process_group_alignment(expected_world_size=None)
+            logger.info(
+                f"FSDP进程组信息: world_size={pg_info['fsdp_world_size']}, "
+                f"rank={pg_info['fsdp_rank']}, "
+                f"env WORLD_SIZE={pg_info['env_world_size']}, "
+                f"env RANK={pg_info['env_rank']}"
+            )
+            
             check_process_group_health(timeout=5.0)
         except RuntimeError as e:
-            logger.error(f"进程组健康检查失败，无法继续执行generate_sequences: {e}")
+            # 如果健康检查失败，提供详细的诊断信息
+            if pg_info is None:
+                try:
+                    pg_info = check_fsdp_process_group_alignment(expected_world_size=None)
+                except:
+                    pg_info = {"fsdp_world_size": "unknown", "fsdp_rank": "unknown"}
+            
+            logger.error(
+                f"进程组健康检查失败，无法继续执行generate_sequences: {e}\n"
+                f"FSDP进程组诊断信息:\n"
+                f"  - FSDP进程组world_size: {pg_info.get('fsdp_world_size', 'unknown')}\n"
+                f"  - 当前进程rank: {pg_info.get('fsdp_rank', 'unknown')}\n"
+                f"  - 环境变量WORLD_SIZE: {pg_info.get('env_world_size', 'unknown')}\n"
+                f"  - 环境变量RANK: {pg_info.get('env_rank', 'unknown')}\n"
+                f"  - AllGather范围: FSDP进程组包含 {pg_info.get('fsdp_world_size', 'unknown')} 个进程（rank 0-{pg_info.get('fsdp_world_size', 0) - 1 if isinstance(pg_info.get('fsdp_world_size'), int) else 'unknown'}）"
+            )
             raise RuntimeError(
-                f"在generate_sequences时检测到进程组不健康。"
-                f"这通常是因为某个NPU/GPU进程已经挂掉。"
-                f"请检查所有进程是否正常运行，或考虑重启训练。"
+                f"在generate_sequences时检测到进程组不健康。\n"
+                f"这通常是因为某个NPU/GPU进程已经挂掉，或者FSDP进程组与新的worker group不匹配。\n\n"
+                f"诊断信息：\n"
+                f"  - FSDP进程组world_size: {pg_info.get('fsdp_world_size', 'unknown')}（这是allgather操作的进程范围）\n"
+                f"  - 当前进程rank: {pg_info.get('fsdp_rank', 'unknown')}\n"
+                f"  - 环境变量WORLD_SIZE: {pg_info.get('env_world_size', 'unknown')}\n"
+                f"  - AllGather范围: FSDP进程组包含 {pg_info.get('fsdp_world_size', 'unknown')} 个进程\n"
+                f"    如果创建了新的worker group（只包含活着的worker），但FSDP进程组仍然指向旧的进程组，\n"
+                f"    allgather会尝试与已死的进程通信，导致失败。\n\n"
+                f"请检查：\n"
+                f"  1. 所有进程是否正常运行\n"
+                f"  2. 如果使用了新的worker group，FSDP进程组是否已更新\n"
+                f"  3. 考虑重启训练\n\n"
                 f"原始错误: {e}"
             ) from e
 
@@ -811,11 +923,34 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 error_msg = str(e).lower()
                 # 检查是否是NPU相关的错误（HcclAllGather等）
                 if any(keyword in error_msg for keyword in ['hccl', 'allgather', 'process exits', 'transport init']):
-                    logger.error(f"在collect_lora_params时检测到NPU进程挂掉: {e}")
+                    # 获取FSDP进程组信息用于诊断
+                    try:
+                        pg_info = check_fsdp_process_group_alignment(expected_world_size=None)
+                    except:
+                        pg_info = {"fsdp_world_size": "unknown", "fsdp_rank": "unknown"}
+                    
+                    logger.error(
+                        f"在collect_lora_params时检测到NPU进程挂掉: {e}\n"
+                        f"FSDP进程组诊断信息:\n"
+                        f"  - FSDP进程组world_size: {pg_info.get('fsdp_world_size', 'unknown')}\n"
+                        f"  - 当前进程rank: {pg_info.get('fsdp_rank', 'unknown')}\n"
+                        f"  - 环境变量WORLD_SIZE: {pg_info.get('env_world_size', 'unknown')}\n"
+                        f"  - AllGather范围: FSDP进程组包含 {pg_info.get('fsdp_world_size', 'unknown')} 个进程"
+                    )
                     raise RuntimeError(
-                        f"在collect_lora_params时检测到NPU进程挂掉。"
-                        f"这通常发生在某个NPU进程异常退出后，FSDP尝试同步参数时失败。"
-                        f"请检查所有NPU进程是否正常运行，或考虑重启训练。"
+                        f"在collect_lora_params时检测到NPU进程挂掉。\n"
+                        f"这通常发生在某个NPU进程异常退出后，FSDP尝试同步参数时失败。\n\n"
+                        f"诊断信息：\n"
+                        f"  - FSDP进程组world_size: {pg_info.get('fsdp_world_size', 'unknown')}（这是allgather操作的进程范围）\n"
+                        f"  - 当前进程rank: {pg_info.get('fsdp_rank', 'unknown')}\n"
+                        f"  - 环境变量WORLD_SIZE: {pg_info.get('env_world_size', 'unknown')}\n"
+                        f"  - AllGather范围: FSDP进程组包含 {pg_info.get('fsdp_world_size', 'unknown')} 个进程（rank 0-{pg_info.get('fsdp_world_size', 0) - 1 if isinstance(pg_info.get('fsdp_world_size'), int) else 'unknown'}）\n"
+                        f"    如果创建了新的worker group（只包含活着的worker），但FSDP进程组仍然指向旧的进程组，\n"
+                        f"    allgather会尝试与已死的进程通信，导致失败。\n\n"
+                        f"请检查：\n"
+                        f"  1. 所有NPU进程是否正常运行\n"
+                        f"  2. 如果使用了新的worker group，FSDP进程组是否已更新\n"
+                        f"  3. 考虑重启训练\n\n"
                         f"原始错误: {e}"
                     ) from e
                 raise
@@ -826,12 +961,35 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 error_msg = str(e).lower()
                 # 检查是否是NPU相关的错误（HcclAllGather等）
                 if any(keyword in error_msg for keyword in ['hccl', 'allgather', 'process exits', 'transport init', 'synchronize']):
-                    logger.error(f"在state_dict()时检测到NPU进程挂掉: {e}")
+                    # 获取FSDP进程组信息用于诊断
+                    try:
+                        pg_info = check_fsdp_process_group_alignment(expected_world_size=None)
+                    except:
+                        pg_info = {"fsdp_world_size": "unknown", "fsdp_rank": "unknown"}
+                    
+                    logger.error(
+                        f"在state_dict()时检测到NPU进程挂掉: {e}\n"
+                        f"FSDP进程组诊断信息:\n"
+                        f"  - FSDP进程组world_size: {pg_info.get('fsdp_world_size', 'unknown')}\n"
+                        f"  - 当前进程rank: {pg_info.get('fsdp_rank', 'unknown')}\n"
+                        f"  - 环境变量WORLD_SIZE: {pg_info.get('env_world_size', 'unknown')}\n"
+                        f"  - AllGather范围: FSDP进程组包含 {pg_info.get('fsdp_world_size', 'unknown')} 个进程"
+                    )
                     raise RuntimeError(
-                        f"在state_dict()时检测到NPU进程挂掉。"
-                        f"这通常发生在某个NPU进程异常退出后，FSDP尝试同步参数时失败。"
-                        f"错误发生在HcclAllGather操作中，这表明分布式通信失败。"
-                        f"请检查所有NPU进程是否正常运行，或考虑重启训练。"
+                        f"在state_dict()时检测到NPU进程挂掉。\n"
+                        f"这通常发生在某个NPU进程异常退出后，FSDP尝试同步参数时失败。\n"
+                        f"错误发生在HcclAllGather操作中，这表明分布式通信失败。\n\n"
+                        f"诊断信息：\n"
+                        f"  - FSDP进程组world_size: {pg_info.get('fsdp_world_size', 'unknown')}（这是allgather操作的进程范围）\n"
+                        f"  - 当前进程rank: {pg_info.get('fsdp_rank', 'unknown')}\n"
+                        f"  - 环境变量WORLD_SIZE: {pg_info.get('env_world_size', 'unknown')}\n"
+                        f"  - AllGather范围: FSDP进程组包含 {pg_info.get('fsdp_world_size', 'unknown')} 个进程（rank 0-{pg_info.get('fsdp_world_size', 0) - 1 if isinstance(pg_info.get('fsdp_world_size'), int) else 'unknown'}）\n"
+                        f"    如果创建了新的worker group（只包含活着的worker），但FSDP进程组仍然指向旧的进程组，\n"
+                        f"    allgather会尝试与已死的进程通信，导致失败。\n\n"
+                        f"请检查：\n"
+                        f"  1. 所有NPU进程是否正常运行\n"
+                        f"  2. 如果使用了新的worker group，FSDP进程组是否已更新\n"
+                        f"  3. 考虑重启训练\n\n"
                         f"原始错误: {e}"
                     ) from e
                 raise

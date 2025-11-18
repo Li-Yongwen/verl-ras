@@ -48,6 +48,76 @@ from verl.utils.device import (
     get_torch_device,
     set_expandable_segments,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def safe_set_npu_device(rank: int):
+    """
+    安全地设置NPU设备，提供详细的错误诊断信息。
+    
+    Args:
+        rank (int): 要设置的设备rank
+        
+    Raises:
+        RuntimeError: 如果NPU设备初始化失败，会抛出包含详细诊断信息的异常
+    """
+    try:
+        get_torch_device().set_device(rank)
+    except RuntimeError as e:
+        error_msg = str(e).lower()
+        # 检查是否是NPU ACL初始化错误
+        if any(keyword in error_msg for keyword in ['npu', 'acl', 'setprecisionmode', 'error code is 500001', 'gelib', 'geinitialize']):
+            logger.error(
+                "NPU设备初始化失败 (rank=%s): %s\n"
+                "诊断信息:\n"
+                "  - LOCAL_RANK: %s\n"
+                "  - RANK: %s\n"
+                "  - WORLD_SIZE: %s\n"
+                "  - ASCEND_RT_VISIBLE_DEVICES: %s\n"
+                "  - 设备ID: %s\n\n"
+                "可能的原因：\n"
+                "  1. 多个进程同时初始化NPU设备导致冲突\n"
+                "  2. NPU设备状态异常或资源不足\n"
+                "  3. ACL库初始化失败（可能是CANN环境问题）\n"
+                "  4. 环境变量配置不正确\n\n"
+                "建议解决方案：\n"
+                "  1. 检查NPU设备状态: npu-smi info\n"
+                "  2. 检查CANN环境是否正确安装和配置\n"
+                "  3. 检查是否有其他进程占用NPU设备\n"
+                "  4. 尝试重启训练或减少并发进程数\n"
+                "  5. 检查ascend日志以获取更多信息",
+                rank, e,
+                os.environ.get('LOCAL_RANK', 'unknown'),
+                os.environ.get('RANK', 'unknown'),
+                os.environ.get('WORLD_SIZE', 'unknown'),
+                os.environ.get('ASCEND_RT_VISIBLE_DEVICES', 'not set'),
+                rank
+            )
+            raise RuntimeError(
+                f"NPU设备初始化失败 (rank={rank})。\n"
+                f"这通常发生在NPU ACL库初始化时，错误代码500001表示ACL内部错误。\n\n"
+                f"诊断信息：\n"
+                f"  - LOCAL_RANK: {os.environ.get('LOCAL_RANK', 'unknown')}\n"
+                f"  - RANK: {os.environ.get('RANK', 'unknown')}\n"
+                f"  - WORLD_SIZE: {os.environ.get('WORLD_SIZE', 'unknown')}\n"
+                f"  - ASCEND_RT_VISIBLE_DEVICES: {os.environ.get('ASCEND_RT_VISIBLE_DEVICES', 'not set')}\n"
+                f"  - 尝试设置的设备ID: {rank}\n\n"
+                f"可能的原因：\n"
+                f"  1. 多个进程同时初始化NPU设备导致ACL库冲突\n"
+                f"  2. NPU设备状态异常或资源不足\n"
+                f"  3. CANN环境配置问题（ACL库初始化失败）\n"
+                f"  4. 环境变量ASCEND_RT_VISIBLE_DEVICES配置不正确\n\n"
+                f"建议解决方案：\n"
+                f"  1. 检查NPU设备状态: npu-smi info\n"
+                f"  2. 检查CANN环境是否正确安装: 查看/var/log/npu/slog/目录下的日志\n"
+                f"  3. 检查是否有其他进程占用NPU设备\n"
+                f"  4. 尝试重启训练或减少并发进程数\n"
+                f"  5. 检查环境变量ASCEND_RT_VISIBLE_DEVICES是否正确设置\n\n"
+                f"原始错误: {e}"
+            ) from e
+        # 其他RuntimeError也重新抛出
+        raise
 from verl.utils.distributed import set_numa_affinity
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.fs import copy_to_local
@@ -199,7 +269,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
                 init_method=os.environ.get("DIST_INIT_METHOD", None),
             )
-            get_torch_device().set_device(rank)
+            safe_set_npu_device(rank)
 
             mpu.initialize_model_parallel(
                 tensor_model_parallel_size=self.config.actor.megatron.tensor_model_parallel_size,
@@ -858,7 +928,7 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
                 timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
                 init_method=os.environ.get("DIST_INIT_METHOD", None),
             )
-            get_torch_device().set_device(rank)
+            safe_set_npu_device(rank)
 
             mpu.initialize_model_parallel(
                 tensor_model_parallel_size=self.config.megatron.tensor_model_parallel_size,
@@ -1139,7 +1209,7 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
                 timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
                 init_method=os.environ.get("DIST_INIT_METHOD", None),
             )
-            get_torch_device().set_device(rank)
+            safe_set_npu_device(rank)
 
             mpu.initialize_model_parallel(
                 tensor_model_parallel_size=self.config.megatron.tensor_model_parallel_size,

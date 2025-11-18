@@ -1649,9 +1649,42 @@ class RayPPOTrainer:
         
         print(f"[INFO] 重建临时worker group，包含 {len(alive_workers)} 个活着的worker")
         
-        # 重建临时worker group
-        self._temp_worker_group = self._rebuild_temp_worker_group(alive_workers, alive_worker_names)
+        # 识别挂掉的 workers 所在的 DP 域
+        dead_dp_ranks = self._identify_dead_dp_ranks(associated_dead_workers, mesh_name="rollout")
         
+        # 重建临时worker group
+        temp_wg = self._rebuild_temp_worker_group(alive_workers, alive_worker_names)
+        
+        # 如果识别到了挂掉的 DP 域，更新 dispatch_info 只保留剩余的 DP 域
+        if dead_dp_ranks and "rollout" in self.actor_rollout_wg._dispatch_info:
+            try:
+                print(f"[INFO] 更新 dispatch_info，排除挂掉的 DP ranks: {sorted(dead_dp_ranks)}")
+                original_dp_rank_mapping = self.actor_rollout_wg._dispatch_info["rollout"]
+                
+                # 获取活着的 workers 在原始 worker group 中的索引
+                alive_worker_indices = []
+                for i, worker in enumerate(self.actor_rollout_wg._workers):
+                    if worker in alive_workers:
+                        alive_worker_indices.append(i)
+                
+                # 只保留不在 dead_dp_ranks 中的 DP ranks
+                filtered_dp_rank_mapping = []
+                for idx in alive_worker_indices:
+                    if idx < len(original_dp_rank_mapping):
+                        dp_rank = original_dp_rank_mapping[idx]
+                        if dp_rank not in dead_dp_ranks:
+                            filtered_dp_rank_mapping.append(dp_rank)
+                
+                # 更新临时 worker group 的 dispatch_info
+                if len(filtered_dp_rank_mapping) == len(temp_wg._workers):
+                    temp_wg._dispatch_info["rollout"] = filtered_dp_rank_mapping
+                    print(f"[INFO] 成功更新 dispatch_info，剩余 {len(filtered_dp_rank_mapping)} 个 workers")
+                else:
+                    print(f"[WARN] DP rank 映射长度不匹配: {len(filtered_dp_rank_mapping)} vs {len(temp_wg._workers)}")
+            except Exception as e:
+                print(f"[WARN] 更新 dispatch_info 失败: {e}，继续使用临时 worker group")
+        
+        self._temp_worker_group = temp_wg
         return self._temp_worker_group
     
     def _get_alive_worker_group(self):
