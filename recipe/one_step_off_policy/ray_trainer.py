@@ -21,6 +21,7 @@ This trainer supports model-agonistic model initialization with huggingface
 import uuid
 import traceback
 from pprint import pprint
+import time
 
 import numpy as np
 import ray
@@ -151,7 +152,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name
         self.validation_generations_logger = ValidationGenerationsLogger()
-
+        self.gen_batch = None
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         self.ref_in_actor = config.actor_rollout_ref.model.get("lora_rank", 0) > 0
 
@@ -341,7 +342,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
         )
         gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-
+        self.gen_batch = gen_batch
         # sync weights from actor to rollout
         self.sync_rollout_weights()
 
@@ -486,7 +487,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         spawned_wgs = wg_dict.spawn(prefix_set=class_dict.keys())
         self.rollout_wg = spawned_wgs[str(Role.Rollout)]
 
-        wg.init_model()
+        self.rollout_wg.init_model()
 
         weights_info = self.actor_wg.get_actor_weights_info()[0]
         self.rollout_wg.set_actor_weights_info(weights_info)
@@ -570,7 +571,11 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                     except Exception:
                         while True:
                             try:
+                                print("[WARN] rollout worker failure detected, recovering")
+                                start_time = time.time()
                                 self._recover_rollout_wg()
+                                end_time = time.time()
+                                print(f"[INFO] rollout_wg task retried successfully in {end_time - start_time:.2f} seconds")
                                 batch_data_future = self._async_gen_next_batch(continuous_iterator)
                                 epoch, batch, gen_batch_output, future_reward = batch_data_future.get()
                             except Exception as e:
@@ -624,7 +629,11 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                     except Exception:
                         while True:
                             try:
+                                print("[WARN] actor worker failure detected, recovering ...")
+                                start_time = time.time()
                                 self._recover_actor_ref_wg()
+                                end_time = time.time()
+                                print(f"[INFO] actor_wg task retried successfully in {end_time - start_time:.2f} seconds")
                                 old_log_prob = self.actor_wg.compute_log_prob(batch)
                             except Exception as e:
                                 pprint(f"[RAS] rebuild failed: {e} \n {traceback.format_exc()}")
@@ -729,6 +738,28 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                     # update actor
                     with marked_timer("update_actor", timing_raw, color="red"):
                         batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+
+                        ready_refs, _ = ray.wait(batch_data_future.gen_batch_output.futures)
+                        if not ready_refs:
+                            pass
+                        else:
+                            try:
+                                ray.get(ready_refs[0])
+                            except Exception as e:
+                                while True:
+                                    try:
+                                        print("[WARN] rollout worker failure detected, recovering")
+                                        start_time = time.time()
+                                        self._recover_rollout_wg()
+                                        end_time = time.time()
+                                        print(f"[INFO] rollout_wg task retried successfully in {end_time - start_time:.2f} seconds")
+                                        batch_data_future.gen_batch_output = self.rollout_wg.async_generate_sequences(self.gen_batch)
+
+                                    except Exception as e:
+                                        pprint(f"[RAS] rebuild failed:{e} \n {traceback.format_exc()}")
+                                    else:
+                                        break
+
                         actor_output = self.actor_wg.update_actor(batch)
                     actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                     metrics.update(actor_output_metrics)
