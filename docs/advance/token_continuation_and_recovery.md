@@ -586,29 +586,30 @@ sequenceDiagram
     participant Queue as Token Queues
     participant Catch as catch_rollout_tokens
     participant Worker as Rollout Worker
-    participant Model as LLM Model
-    
+    participant Model as vLLM worker
+    participant IndexQueue as index_prompt_token_queue
+
     Note over Trainer: 训练循环开始
     Trainer->>Trainer: 创建gen_batch_output
-    Trainer->>Trainer: 分配global_id
+    Trainer->>Trainer: 给gen_batch_output分配global_id
     Trainer->>Queue: 设置不可读状态
     Trainer->>Queue: 更新index_prompt_tokens
     Trainer->>Queue: 恢复可读状态
-    
     Trainer->>Worker: generate_sequences(gen_batch_output)
-    
+
     loop 每个生成步骤
         Worker->>Model: 前向推理
         Model-->>Worker: 返回logits
         Worker->>Worker: 采样token
         Worker->>Queue: 发送token到tokens_queue
-        Queue->>Catch: token_per_req
-        Catch->>Catch: _parse_req_tokens()
-        Catch->>Queue: 更新index_prompt_tokens_queue
+        Queue->>Catch: 读取token_per_req
+        Catch->>IndexQueue: _parse_req_tokens()解析信息存入IndexQueue
     end
-    
+
     Worker-->>Trainer: 返回生成结果
     Trainer->>Trainer: 继续训练流程
+    Trainer->>IndexQueue: 清空IndexQueue（每个训练轮结束后执行）
+    Note over Trainer: 每个训练轮次末尾，在训练结束之后清空IndexQueue
 ```
 
 #### 6.2.2 异常恢复流程时序图
@@ -617,8 +618,11 @@ sequenceDiagram
 sequenceDiagram
     participant Trainer as RayPPOTrainer
     participant Queue as Token Queues
+    participant Catch as catch_rollout_tokens
     participant Recover as 异常恢复模块
     participant Worker as Rollout Worker
+    participant Model as vLLM worker
+    participant IndexQueue as index_prompt_token_queue
     participant Resource as Resource Pool
     
     Note over Trainer: 检测到异常
@@ -636,15 +640,29 @@ sequenceDiagram
     Recover-->>Trainer: Worker Group已恢复
     
     Trainer->>Trainer: _update_gen_batch_with_partial_tokens()
-    Trainer->>Queue: 获取已生成tokens
-    Queue-->>Trainer: index_prompt_tokens
-    Trainer->>Trainer: 构建新prompt
-    Trainer->>Trainer: 计算续推参数
+    Trainer->>Queue: 设置不可读状态
+    Trainer->>IndexQueue: 获取已生成tokens
+    IndexQueue-->>Trainer: index_prompt_tokens
+    Trainer->>Trainer: 构建新prompt（包含已生成tokens）
+    Trainer->>Trainer: 给续推请求分配global_id
+    Trainer->>Queue: 更新index_prompt_tokens
+    Trainer->>Queue: 恢复可读状态
     
-    Trainer->>Worker: generate_sequences(续推)
+    Trainer->>Worker: generate_sequences(续推gen_batch_output)
+    
+    loop 每个生成步骤（续推）
+        Worker->>Model: 前向推理
+        Model-->>Worker: 返回logits
+        Worker->>Worker: 采样token
+        Worker->>Queue: 发送token到tokens_queue
+        Queue->>Catch: 读取token_per_req
+        Catch->>IndexQueue: _parse_req_tokens()解析信息存入IndexQueue
+    end
+    
     Worker-->>Trainer: 返回续推结果
-    
+    Trainer->>Trainer: 继续训练流程
     Trainer->>Queue: _reset_tokens_queue()
+    Trainer->>IndexQueue: 清空IndexQueue（每个训练轮结束后执行）
     Note over Trainer: 恢复训练流程
 ```
 
@@ -653,14 +671,28 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant Worker as Rollout Worker
+    participant Model as vLLM worker
+    participant PatchStep as patch_step
     participant Queue1 as tokens_queue
     participant Catch as catch_rollout_tokens
     participant Queue2 as index_prompt_tokens_queue
     participant Status as _index_prompt_tokens_status
     
-    loop 持续监听
-        Worker->>Queue1: put(token_per_req)
-        Queue1->>Catch: get()
+    loop 每个生成步骤
+        Worker->>Model: 前向推理
+        Model-->>Worker: 返回logits和sampled_token_ids
+        Worker->>PatchStep: 调用patch_step()
+        
+        PatchStep->>PatchStep: 检查scheduler.has_requests()
+        PatchStep->>PatchStep: scheduler.schedule()
+        PatchStep->>PatchStep: execute_model_with_error_logging()
+        PatchStep->>PatchStep: scheduler.update_from_output()
+        
+        PatchStep->>PatchStep: 构建req_info和finished_global_ids
+        PatchStep->>Queue1: put(step_result)
+        Note over Queue1: step_result包含:<br/>finished_global_ids<br/>req_info{global_req_id: {req_id, sampled_token_ids, req_id_to_index}}
+        
+        Queue1->>Catch: get()读取step_result
         
         Catch->>Status: 检查可读状态
         alt 状态不可读
@@ -671,11 +703,11 @@ sequenceDiagram
         Catch->>Queue2: 获取当前token索引
         Queue2-->>Catch: index_prompt_tokens
         
-        Catch->>Catch: 解析token_per_req
-        Catch->>Catch: 更新new_token_ids
-        Catch->>Catch: 移除finished_global_ids
+        Catch->>Catch: _parse_req_tokens()解析step_result
+        Catch->>Catch: 根据global_req_id更新new_token_ids
+        Catch->>Catch: 移除finished_global_ids对应的条目
         
-        Catch->>Queue2: 保存更新后的索引
+        Catch->>Queue2: 保存更新后的index_prompt_tokens
         Catch->>Status: 恢复可读状态
     end
 ```

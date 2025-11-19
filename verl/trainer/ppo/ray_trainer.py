@@ -1255,6 +1255,26 @@ class RayPPOTrainer:
             raise RuntimeError("index_prompt_tokens_queue size error")
         self._set_tokens_queue_readable_status(readable=True)
 
+
+    def _init_req_token_queue_with_prompts(self, gen_batch_output):
+        """
+        初始化请求token队列。将每个请求的原始prompt信息写入index_prompt_tokens_queue。
+        """
+        while not self._get_tokens_queue_readable_status():
+            time.sleep(0.5)
+        self._set_tokens_queue_readable_status(readable=False)
+        prompts = gen_batch_output.non_tensor_batch["raw_prompt_ids"]
+        global_ids = gen_batch_output.non_tensor_batch["global_id"]
+        if self.index_prompt_tokens_queue.size() == 0:
+            self.index_prompt_tokens = {}
+        else:
+            self.index_prompt_tokens = self.index_prompt_tokens_queue.get()
+        for i, global_id in enumerate(global_ids):
+            self.index_prompt_tokens.setdefault(global_id, {"raw_prompt_ids": [], "new_token_ids": []})
+            self.index_prompt_tokens[global_id]["raw_prompt_ids"] = prompts[i]
+        self.index_prompt_tokens_queue.put(self.index_prompt_tokens)
+        self._set_tokens_queue_readable_status(readable=True)
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1352,20 +1372,8 @@ class RayPPOTrainer:
                 gen_batch_output_ori.non_tensor_batch["global_id"] = np.array(
                     [str("bing"+str(i)) for i in range(len(gen_batch_output.batch))], dtype=object
                     )
-                while not self._get_tokens_queue_readable_status():
-                    time.sleep(0.5)
-                self._set_tokens_queue_readable_status(readable=False)
-                prompts = gen_batch_output.non_tensor_batch["raw_prompt_ids"]
-                global_ids=gen_batch_output.non_tensor_batch["global_id"]
-                if self.index_prompt_tokens_queue.size()==0:
-                    self.index_prompt_tokens={}
-                else:
-                    self.index_prompt_tokens=self.index_prompt_tokens_queue.get()
-                for i, global_id in enumerate(global_ids):
-                    self.index_prompt_tokens.setdefault(global_id, {"raw_prompt_ids": [], "new_token_ids": []})
-                    self.index_prompt_tokens[global_id]["raw_prompt_ids"] = prompts[i]
-                self.index_prompt_tokens_queue.put(self.index_prompt_tokens)
-                self._set_tokens_queue_readable_status(readable=True)
+
+                self._init_req_token_queue_with_prompts(gen_batch_output)
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
