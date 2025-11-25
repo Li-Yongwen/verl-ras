@@ -25,7 +25,8 @@ from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pprint import pprint
-from typing import Optional
+from typing import List, Optional
+import time
 
 import numpy as np
 import ray
@@ -59,6 +60,8 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
+from verl.utils.model import compute_position_id_with_mask
+from ray.util.queue import Queue
 
 
 @dataclass
@@ -311,6 +314,7 @@ class RayPPOTrainer:
         self.config = config
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
+        self.thread_flag = True
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
@@ -344,6 +348,27 @@ class RayPPOTrainer:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+        self.tokens_queue= Queue()
+        self.requests_queue= Queue()
+        self.index_prompt_tokens= defaultdict() # 临时存储
+        self.requests_tokens = []
+        self._index_prompt_tokens_status = Queue()
+        #通过_set_tokens_queue_readable_status和_get_tokens_queue_readable_status获取index_prompt_tokens_queue的可读状态
+        self._index_prompt_tokens_status.put(1)
+        self.index_prompt_tokens_queue = Queue()
+
+    def _set_tokens_queue_readable_status(self, readable: bool):
+        len_queue = self._index_prompt_tokens_status.size()
+        for _ in range(len_queue):
+            self._index_prompt_tokens_status.get()
+        if readable:
+            self._index_prompt_tokens_status.put(1)
+        else:
+            return
+
+    def _get_tokens_queue_readable_status(self):
+        return self._index_prompt_tokens_status.size()==1
+
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -511,17 +536,26 @@ class RayPPOTrainer:
         # Log to each configured logger
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
-    def _get_gen_batch(self, batch: DataProto) -> DataProto:
-        reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
-
+    def _get_gen_batch(
+        self,
+        batch: DataProto,
+        input_batch_keys_to_pop: List[str] = [
+            "input_ids",
+            "attention_mask",
+            "position_ids",
+        ],
+    ) -> DataProto:
+        reward_model_keys = (
+            set({"data_source", "reward_model", "extra_info"})
+            & batch.non_tensor_batch.keys()
+        )
         # pop those keys for generation
-        batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+        batch_keys_to_pop = input_batch_keys_to_pop
         non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_model_keys
         gen_batch = batch.pop(
             batch_keys=batch_keys_to_pop,
             non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
         )
-
         # For agent loop, we need reward model keys to compute score.
         if self.async_rollout_mode:
             gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
@@ -770,7 +804,7 @@ class RayPPOTrainer:
 
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
         self.actor_rollout_wg = all_wg[str(actor_role)]
-        self.actor_rollout_wg.init_model()
+        self.actor_rollout_wg.init_model(self.tokens_queue, self.requests_queue)
 
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
@@ -899,6 +933,14 @@ class RayPPOTrainer:
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
+        # rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+        # rollout_file = f"{rollout_data_dir}/{self.global_steps+1}.data"
+        # print(f"DEBUG try load rollout from {rollout_file}")
+        # try:
+        #     self._recoverd_rollout = DataProto.load_from_disk(rollout_file)
+        # except Exception as e:
+        #     print(f"DEBUG load rollout data failed, due to {e}")
+
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
         if do_profile:
@@ -958,6 +1000,227 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
+
+    def _load_rollout(self):
+        rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+        rollout_file = f"{rollout_data_dir}/{self.global_steps}.data"
+        print(f"DEBUG try load rollout from {rollout_file}")
+        try:
+            return DataProto.load_from_disk(rollout_file)
+        except Exception as e:
+            print(f"DEBUG load rollout data failed, due to {e}")
+            return None
+
+    def _save_rollout(self, batch):
+        rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+        if rollout_data_dir is None:
+            return
+        rollout_file = f"{rollout_data_dir}/{self.global_steps}.data"
+        batch.save_to_disk(rollout_file)
+
+    def _parse_req_tokens(self, token_per_req: dict) -> dict:
+        """
+        从新的 step_result 数据结构中提取 tokens 信息。
+        Args:
+            token_per_req: step_result 字典，包含：
+                - finished_req_ids: 已完成的请求 ID 列表(全局id)
+                - req_info: 字典，key 为 global_req_id，value 包含：
+                    - req_id: vLLM 的 req_id
+                    - sampled_token_ids: 采样的 token IDs
+                    - req_id_to_index: vLLM 内部的索引
+        Returns:
+            字典，格式为 {global_req_id: {"raw_prompt_ids": [...], "new_token_ids": [...]}}
+        """
+        while not self._get_tokens_queue_readable_status():
+            time.sleep(1)
+        self._set_tokens_queue_readable_status(readable=False)
+        if self.index_prompt_tokens_queue.size()==0:
+            self.index_prompt_tokens = {}
+        elif self.index_prompt_tokens_queue.size()==1:
+            self.index_prompt_tokens=self.index_prompt_tokens_queue.get()
+        else:
+            raise RuntimeError("index_prompt_tokens_queue size error")
+        req_info = token_per_req.get("req_info", {})
+        finished_global_ids=token_per_req.get("finished_global_ids",{})
+        for global_req_id, req_info in req_info.items():
+            sampled_token_ids = req_info.get("sampled_token_ids", [])
+            if hasattr(sampled_token_ids, 'tolist'):
+                new_token_ids = sampled_token_ids.tolist()
+            elif isinstance(sampled_token_ids, (list, tuple)):
+                new_token_ids = list(sampled_token_ids)
+            else:
+                new_token_ids = [sampled_token_ids] if sampled_token_ids is not None else []
+            self.index_prompt_tokens.setdefault(global_req_id, {
+                "raw_prompt_ids": [],
+                "new_token_ids": []
+            })
+            self.index_prompt_tokens[global_req_id]["new_token_ids"].extend(new_token_ids)
+        for finished_global_id in finished_global_ids:
+            self.index_prompt_tokens.pop(finished_global_id)
+        self.index_prompt_tokens_queue.put(self.index_prompt_tokens)
+        self._set_tokens_queue_readable_status(readable=True)
+
+
+    @ray.remote(num_cpus=1)
+    def catch_rollout_tokens(self):
+        while True:
+            token_per_req = self.tokens_queue.get()
+            self._parse_req_tokens(token_per_req)
+
+
+    def _recover_actor_rollout_ref_wg(self):
+        print("[INFO] Recreating actor rollout and reference policy worker groups")
+
+        # release the placement groups and actor_rollout_wg
+        try:
+            if hasattr(self, "actor_rollout_wg") and self.actor_rollout_wg is not None:
+                try:
+                    actor_rollout_resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+                    actor_rollout_resource_pool.release_placement_groups()
+                except Exception as e:
+                    print(f"Error releasing actor rollout placement group: {e}")
+
+                del self.actor_rollout_wg
+                print("[INFO] Old actor rollout wg terminated")
+        except Exception as e:
+            print(f"[WARN] Failed to cleanup old actor rollout worker: {e}")
+
+
+        # release the ref_wg
+        try:
+            if hasattr(self, "ref_policy_wg") and self.ref_policy_wg is not None:
+                del self.ref_policy_wg
+                print("[INFO] Old ref wg terminated")
+        except Exception as e:
+            print(f"[WARN] Failed to cleanup old ref worker: {e}")
+
+        # get resource pool
+        resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+
+        # create new actor/ref RayClassWithInitArgs
+        actor_rollout_cls = RayClassWithInitArgs(
+            cls = self.role_worker_mapping[Role.ActorRollout],
+            config = self.config.actor_rollout_ref,
+            role=str(Role.ActorRollout),
+        )
+
+        ref_cls = RayClassWithInitArgs(
+            cls = self.role_worker_mapping[Role.RefPolicy],
+            config = self.config.actor_rollout_ref,
+            role=str(Role.RefPolicy),
+        )
+
+        class_dict = {
+            str(Role.ActorRollout): actor_rollout_cls,
+            str(Role.RefPolicy): ref_cls,
+        }
+
+        # update resource pool to cls dict
+        if resource_pool not in self.resource_pool_to_cls:
+            self.resource_pool_to_cls[resource_pool] = {}
+        self.resource_pool_to_cls[resource_pool].update(class_dict)
+
+        # create worker dict cls and wg
+        wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
+        if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
+            wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
+        if OmegaConf.select(self.config.global_profiler, "steps") is not None:
+            wg_kwargs["profile_steps"] = OmegaConf.select(self.config.global_profiler, "steps")
+            # Only require nsight worker options when tool is nsys
+            if OmegaConf.select(self.config.global_profiler, "tool") == "nsys":
+                assert (
+                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
+                    is not None
+                ), "worker_nsight_options must be set when using nsys with profile_steps"
+                wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(
+                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
+                )
+        wg_kwargs["device_name"] = self.device_name
+        worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
+        wg_dict = self.ray_worker_group_cls(
+            resource_pool=resource_pool,
+            ray_cls_with_init=worker_dict_cls,
+            **wg_kwargs,
+        )
+        spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
+        self.actor_rollout_wg = spawn_wg[str(Role.ActorRollout)]
+        self.ref_policy_wg = spawn_wg[str(Role.RefPolicy)]
+
+        # initialize models
+        print("initializing actor rollout models")
+        self.actor_rollout_wg.init_model()
+        print("actor rollout models initialized")
+        print("initializing ref policy models")
+        self.ref_policy_wg.init_model()
+        print("ref policy models initialized")
+
+        # create async rollout manager and request scheduler
+        self.async_rollout_mode = False
+        if self.config.actor_rollout_ref.rollout.mode == "async":
+            from verl.experimental.agent_loop import AgentLoopManager
+            self.async_rollout_mode = True
+            self.async_rollout_manager = AgentLoopManager(
+                config=self.config, worker_group=self.actor_rollout_wg, rm_wg=self.rm_wg
+            )
+
+        print("[INFO] Actor rollout and reference policy worker groups recovered")
+
+
+
+    def modify_json_file(self):
+        import json
+        import time
+        self.thread_flag = False
+        time.sleep(10)
+
+        try:
+            with open('raise_flag.json', 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            if not data['write_flag']:
+                data['write_flag'] = True
+                data['raise_flag'] = True
+                with open('raise_flag.json', 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=4)
+                    print("The json file written success")
+        except Exception as e:
+            print(f"Error modifying json file: {e}")
+
+
+    def _reset_tokens_queue(self, retry_times=10):
+        while (not self._get_tokens_queue_readable_status() and retry_times>0):
+            time.sleep(0.5)
+            retry_times-=1
+        if retry_times==0:
+            raise RuntimeError(f"get_tokens_queue_readable_status failed, have retried {retry_times} times.")
+        self._set_tokens_queue_readable_status(readable=False)
+        if self.index_prompt_tokens_queue.size() in [0, 1]:
+            if self.index_prompt_tokens_queue.size():
+                self.index_prompt_tokens_queue.get()
+        else:
+            raise RuntimeError("index_prompt_tokens_queue size error")
+        self._set_tokens_queue_readable_status(readable=True)
+
+
+    def _init_req_token_queue_with_prompts(self, gen_batch_output):
+        """
+        初始化请求token队列。将每个请求的原始prompt信息写入index_prompt_tokens_queue。
+        """
+        while not self._get_tokens_queue_readable_status():
+            time.sleep(0.5)
+        self._set_tokens_queue_readable_status(readable=False)
+        prompts = gen_batch_output.non_tensor_batch["raw_prompt_ids"]
+        global_ids = gen_batch_output.non_tensor_batch["global_id"]
+        if self.index_prompt_tokens_queue.size() == 0:
+            self.index_prompt_tokens = {}
+        else:
+            self.index_prompt_tokens = self.index_prompt_tokens_queue.get()
+        for i, global_id in enumerate(global_ids):
+            self.index_prompt_tokens.setdefault(global_id, {"raw_prompt_ids": [], "new_token_ids": []})
+            self.index_prompt_tokens[global_id]["raw_prompt_ids"] = prompts[i]
+        self.index_prompt_tokens_queue.put(self.index_prompt_tokens)
+        self._set_tokens_queue_readable_status(readable=True)
+
     def fit(self):
         """
         The training loop of PPO.
@@ -965,6 +1228,8 @@ class RayPPOTrainer:
         to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
+        self.catch_rollout_tokens.remote(self)
+
         from omegaconf import OmegaConf
 
         from verl.utils.tracking import Tracking
@@ -1039,13 +1304,163 @@ class RayPPOTrainer:
                 gen_batch_output = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
+                gen_batch_output_tmp = gen_batch.repeat(
+                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                )
+                gen_batch_output_ori = gen_batch.repeat(
+                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                )
+
+                gen_batch_output.non_tensor_batch["global_id"] = np.array(
+                    [str("bing"+str(i)) for i in range(len(gen_batch_output.batch))], dtype=object
+                )
+
+                gen_batch_output_tmp.non_tensor_batch["global_id"] = np.array(
+                    [str("bing"+str(i)) for i in range(len(gen_batch_output.batch))], dtype=object
+                )
+                gen_batch_output_ori.non_tensor_batch["global_id"] = np.array(
+                    [str("bing"+str(i)) for i in range(len(gen_batch_output.batch))], dtype=object
+                    )
+
+                self._init_req_token_queue_with_prompts(gen_batch_output)
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
+                            def _update_gen_batch_with_partial_tokens(
+                                gen_batch_output_tmp: DataProto,
+                            ) -> DataProto:
+                                # 1. 从队列中获取第一轮推理的输出 tokens
+                                if self.index_prompt_tokens_queue.size()==1:
+                                    tmp = self.index_prompt_tokens_queue.get()
+                                    all_tokens = tmp  # 格式: {global_id: {"raw_prompt_ids": [...], "new_token_ids": [...]}}
+                                    self.index_prompt_tokens_queue.put(tmp)
+                                else:
+                                    print("error")
+                                # 2. 确保使用 gen_batch_output_tmp 的原始数据（未进入第一次 generate_sequences）
+                                # gen_batch_output_tmp 已经在第一次调用前创建，包含原始数据
+                                batch_size = gen_batch_output_tmp.batch.batch_size[0]
+                                # 3. 按照 gen_batch_output_tmp 的 global_id 顺序获取 tokens，确保顺序一致
+                                global_ids = gen_batch_output_tmp.non_tensor_batch["global_id"]
+                                all_raw_prompt_ids = []
+                                all_new_token_ids = []
+                                for global_id in global_ids:
+                                    token_info = all_tokens.get(global_id, {"raw_prompt_ids": [], "new_token_ids": []})
+                                    all_raw_prompt_ids.append(token_info.get('raw_prompt_ids', []))
+                                    all_new_token_ids.append(token_info.get('new_token_ids', []))
+                                # 4. 计算每请求生成的 tokens 数量
+                                per_request_generated_tokens = [0] * batch_size
+                                for idx, gen_token_num in enumerate(all_new_token_ids):
+                                    if gen_token_num != []:
+                                        per_request_generated_tokens[idx] = len(gen_token_num)
+                                gen_batch_output_tmp.non_tensor_batch["per_request_generated_tokens"] = np.array(
+                                    per_request_generated_tokens
+                                )
+                                # 5. 构建新的 prompts: raw_prompt_ids + new_token_ids（第一轮生成的 tokens）
+                                # 拼接后得到新的 prompt（未 padding）
+                                new_prompts = [all_raw_prompt_ids[i] + all_new_token_ids[i] for i in range(batch_size)]
+                                new_prompt_lengths = [len(p) for p in new_prompts]
+                                max_prompt_len = max(new_prompt_lengths) if new_prompt_lengths else 0
+                                # 6. 获取目标 padding 长度
+                                # 注意：作为第二次 generate_sequences 的输入，prompts 和 input_ids 应该只包含 prompt 部分
+                                # 应该使用第一次输出的 prompts 长度（prompt_length），而不是 input_ids 长度（prompt_length + response_length）
+                                target_prompt_len = None
+                                if 'input_ids' in gen_batch_output_tmp.batch:
+                                    # 使用第一次输出的 prompts 长度（这是 prompt 部分的长度，已经 left-padded）
+                                    target_prompt_len = gen_batch_output_tmp.batch['input_ids'].shape[-1]
+                                if target_prompt_len is None:
+                                    target_prompt_len = max_prompt_len
+                                # 确保 target_prompt_len 至少等于 max_prompt_len（不能小于实际内容长度）
+                                target_prompt_len = max(target_prompt_len, max_prompt_len)
+                                # 7. 获取设备信息（优先从 gen_batch_output 获取，因为它们在同一个设备上）
+                                device = None
+                                dtype = None
+                                if 'input_ids' in gen_batch_output_tmp.batch:
+                                    ref_tensor = gen_batch_output_tmp.batch['input_ids']
+                                    device = ref_tensor.device
+                                    dtype = ref_tensor.dtype
+                                elif 'prompts' in gen_batch_output_tmp.batch:
+                                    ref_tensor = gen_batch_output_tmp.batch['prompts']
+                                    device = ref_tensor.device
+                                    dtype = ref_tensor.dtype
+                                elif 'responses' in gen_batch_output_tmp.batch:
+                                    ref_tensor = gen_batch_output_tmp.batch['responses']
+                                    device = ref_tensor.device
+                                    dtype = ref_tensor.dtype
+                                else:
+                                    device = torch.device('cpu')
+                                    dtype = torch.long
+                                # 8. 获取 pad_token_id（优先从 gen_batch_output_tmp.meta_info 获取）
+                                pad_token_id = gen_batch_output_tmp.meta_info.get("pad_token_id")
+                                if pad_token_id is None:
+                                    pad_token_id = self.tokenizer.pad_token_id
+                                if pad_token_id is None:
+                                    # 如果 pad_token_id 仍然为 None，使用 eos_token_id（vLLM 的默认行为）
+                                    pad_token_id = self.tokenizer.eos_token_id if hasattr(self.tokenizer, 'eos_token_id') else 0
+                                # 9. Padding prompts 并转换为 tensor（使用 left pad，与原始 gen_batch 保持一致）
+                                # 参考 postprocess_data 的实现，使用 left pad（padding 在左侧，有效内容在右侧）
+                                # 使用 target_prompt_len 作为 padding 长度，确保与第一次输入的 prompt 部分长度一致
+                                unpadded_prompts_list = []
+                                for prompt in new_prompts:
+                                    if len(prompt) > 0:
+                                        prompt_tensor = torch.tensor(prompt, dtype=dtype, device=device)
+                                        # 如果长度小于 target_prompt_len，需要 pad 到 target_prompt_len
+                                        if len(prompt) < target_prompt_len:
+                                            # 使用 left pad：在左侧添加 padding
+                                            pad_length = target_prompt_len - len(prompt)
+                                            padded = torch.cat([
+                                                torch.full((pad_length,), pad_token_id, dtype=dtype, device=device),
+                                                prompt_tensor
+                                            ])
+                                            unpadded_prompts_list.append(padded)
+                                        else:
+                                            # 如果长度大于 target_prompt_len，截断到 target_prompt_len
+                                            unpadded_prompts_list.append(prompt_tensor[:target_prompt_len])
+                                    else:
+                                        # 空序列，全部 padding
+                                        unpadded_prompts_list.append(
+                                            torch.full((target_prompt_len,), pad_token_id, dtype=dtype, device=device)
+                                        )
+                                # 堆叠成 batch tensor
+                                prompts_tensor = torch.stack(unpadded_prompts_list, dim=0)
+                                # 10. 更新 gen_batch_output_tmp 的必要参数
+                                # input_ids 就是 padded_prompts（已经包含了原始 prompt + 第一轮生成的 tokens）
+                                gen_batch_output_tmp.batch['input_ids'] = prompts_tensor
+                                # 11. 构建 attention_mask: 基于实际长度（有效部分为1，padding部分为0）
+                                # 使用 left pad，所以有效部分在右侧
+                                # 使用 target_prompt_len 作为长度，确保与第一次输入的 prompt 部分长度一致
+                                attention_mask = torch.zeros((batch_size, target_prompt_len), dtype=torch.long, device=device)
+                                for i, prompt_len in enumerate(new_prompt_lengths):
+                                    # 有效部分在右侧（left pad），但不超过 target_prompt_len
+                                    actual_len = min(prompt_len, target_prompt_len)
+                                    attention_mask[i, -actual_len:] = 1  # 有效部分在右侧（left pad）
+                                gen_batch_output_tmp.batch['attention_mask'] = attention_mask
+                                # 12. 计算 position_ids: 基于 attention_mask（与原始 gen_batch 保持一致）
+                                position_ids = compute_position_id_with_mask(attention_mask)
+                                gen_batch_output_tmp.batch['position_ids'] = position_ids
+
+                                # 13. 更新 raw_prompt_ids（用于后续处理）
+                                gen_batch_output_tmp.non_tensor_batch["raw_prompt_ids"] = np.array(
+                                    new_prompts, dtype=object)
+                                return gen_batch_output_tmp
+
+                            try:
+                                import time, threading
+                                if self.thread_flag:
+                                    thread = threading.Thread(target=self.modify_json_file)
+                                    thread.start()
+                                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
+                            except:
+                                self._recover_actor_rollout_ref_wg()
+                                _update_gen_batch_with_partial_tokens(gen_batch_output)
+                                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
+                                gen_batch_output.non_tensor_batch["per_request_generated_tokens"] = np.zeros_like(
+                                    gen_batch_output.non_tensor_batch["per_request_generated_tokens"]
+                                )
+                            finally:
+                                self._reset_tokens_queue()
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
 
@@ -1140,7 +1555,7 @@ class RayPPOTrainer:
                                 # TODO: we may want to add diff of probs too.
                                 from verl.utils.debug.metrics import calculate_debug_metrics
 
-                                metrics.update(calculate_debug_metrics(batch))
+                            metrics.update(calculate_debug_metrics(batch))
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 

@@ -136,7 +136,6 @@ class vLLMRollout(BaseRollout):
         device_mesh: DeviceMesh,
     ):
         super().__init__(config, model_config, device_mesh)
-
         if config.layered_summon:
             self.sleep_level = 1
         else:
@@ -385,30 +384,81 @@ class vLLMRollout(BaseRollout):
                 lora_requests = [
                     LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="/simon-stub-path")
                 ] * batch_size
+        # Handle per-request max_tokens for resume requests
+        per_request_generated_tokens = prompts.non_tensor_batch.get("per_request_generated_tokens", [0] * len(prompts))
+        per_request_max_tokens = [
+            self.sampling_params.max_tokens - generated_tokens
+            for generated_tokens in per_request_generated_tokens
+        ]
+        
+        is_continuation = not all(token == 0 for token in per_request_generated_tokens)
+        if is_continuation:
+            print(f"[debug] token continuation, per_request_max_tokens={per_request_max_tokens}")
+            # 分离有效请求（max_tokens > 0）和无效请求（max_tokens <= 0）
+            valid_indices = [i for i, mt in enumerate(per_request_max_tokens) if mt > 0]
+            invalid_indices = [i for i, mt in enumerate(per_request_max_tokens) if mt <= 0]
+            
+            if invalid_indices:
+                print(f"[Token续推] {len(invalid_indices)}/{batch_size} 个请求 max_tokens<=0，将返回空response")
+                
+            valid_vllm_inputs = [vllm_inputs[i] for i in valid_indices]
+            valid_sampling_params = [
+                SamplingParams(
+                    max_tokens=per_request_max_tokens[i],
+                    n=self.sampling_params.n,
+                    logprobs=self.sampling_params.logprobs,
+                    temperature=self.sampling_params.temperature,
+                    top_p=self.sampling_params.top_p,
+                    top_k=self.sampling_params.top_k,
+                    repetition_penalty=self.sampling_params.repetition_penalty,
+                    detokenize=self.sampling_params.detokenize,
+                )
+                for i in valid_indices
+            ]
+            valid_lora_requests = [lora_requests[i] for i in valid_indices] if lora_requests else None
+        else:
+            print("[debug] no token continuation.....")
+            valid_indices = list(range(batch_size))
+            invalid_indices = []
+            valid_vllm_inputs = vllm_inputs
+            valid_sampling_params = self.sampling_params
+            valid_lora_requests = lora_requests
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
-            outputs = self.inference_engine.generate(
-                prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
-                lora_request=lora_requests,
-                use_tqdm=False,
-            )
-
-            # TODO(sgm): disable logprob when recompute_log_prob is enable
-            # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
-
-            response = []
-            rollout_log_probs = []
-            for output in outputs:
-                for sample_id in range(len(output.outputs)):
-                    response_ids = output.outputs[sample_id].token_ids
-                    response.append(response_ids)
-                    if self.config.calculate_log_probs:
-                        curr_log_prob = []
-                        for i, logprob in enumerate(output.outputs[sample_id].logprobs):
-                            curr_log_prob.append(logprob[response_ids[i]].logprob)
-                        rollout_log_probs.append(curr_log_prob)
+            valid_response = []
+            valid_rollout_log_probs = []
+            if valid_indices:
+                outputs = self.inference_engine.generate(
+                    prompts=valid_vllm_inputs,
+                    sampling_params=valid_sampling_params,
+                    lora_request=valid_lora_requests,
+                    use_tqdm=False,
+                )
+                for output in outputs:
+                    for sample_id in range(len(output.outputs)):
+                        response_ids = output.outputs[sample_id].token_ids
+                        valid_response.append(response_ids)
+                        if self.config.calculate_log_probs:
+                            valid_rollout_log_probs.append([
+                                logprob[response_ids[i]].logprob
+                                for i, logprob in enumerate(output.outputs[sample_id].logprobs)
+                            ])
+                            
+            response = [None] * batch_size
+            rollout_log_probs = [None] * batch_size if self.config.calculate_log_probs else []
+            for idx_, valid_idx in enumerate(valid_indices):
+                response[valid_idx] = valid_response[idx_]
+                if self.config.calculate_log_probs:
+                    rollout_log_probs[valid_idx] = valid_rollout_log_probs[idx_]
+            for invalid_idx in invalid_indices:
+                response[invalid_idx] = []
+                if self.config.calculate_log_probs:
+                    rollout_log_probs[invalid_idx] = []
+                    
+            response = [r if r is not None else [] for r in response]
+            if self.config.calculate_log_probs:
+                rollout_log_probs = [r if r is not None else [] for r in rollout_log_probs]
 
             response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
                 idx.device

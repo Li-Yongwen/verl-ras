@@ -297,10 +297,10 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             assert os.path.exists(local_path), f"Checkpoint path {local_path} does not exist."
 
         # For load optimizer dist_ckpt
-        import transformer_engine
+        from apex.optimizers import FusedAdam
 
         torch.serialization.add_safe_globals([torch.optim.AdamW])
-        torch.serialization.add_safe_globals([transformer_engine.pytorch.optimizers.fused_adam.FusedAdam])
+        torch.serialization.add_safe_globals([FusedAdam])
 
         dist_checkpoint_path = get_dist_checkpoint_path(local_path)
 
@@ -577,7 +577,36 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         if self.checkpoint_config.async_save:
             assert async_save_request is not None, "Async save request should not be None when using async save."
             async_save_request.add_finalize_fn(finalize_save_fn)
+
+            import threading
+            from megatron.core.dist_checkpointing.strategies.base import async_calls
+            call_idx = async_calls.schedule_async_request(async_save_request)
+            async_calls.maybe_finalize_async_calls(blocking=False)
+            t = threading.Thread(target=finalize_async_calls, daemon=True, args=(async_calls, call_idx))
+            t.start()
         else:
             finalize_save_fn()
 
         self.previous_saved_paths.append(local_path)
+
+
+def finalize_async_calls(async_calls_queue, call_idx: int):
+    from datetime import datetime
+    rank = torch.distributed.get_rank()
+    print(
+        f"[LIRUI] rank: {rank} {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        f"begin exec finalize_async_calls",
+        flush=True)
+    for async_call in async_calls_queue.async_calls:
+        if async_call is None or async_call.idx != call_idx:
+            continue
+        if async_call.async_caller.is_current_async_call_done(True, False):
+            for finalize_fn in async_call.async_request.finalize_fns:
+                print(f"[LIRUI] rank: {rank} {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
+                      f"success exec finalize_async_calls, len {len(async_call.async_request.finalize_fns)} call_idx {call_idx}",
+                      flush=True)
+                finalize_fn()
+            print(f"[LIRUI] rank: {rank} {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
+                  f"end exec finalize_async_calls, len {len(async_call.async_request.finalize_fns)} call_idx {call_idx}",
+                  flush=True)
+            return

@@ -61,6 +61,11 @@ def load_dist_checkpointing(sharded_state_dict, ckpt_dir):
         pass
 
     # Load model sharded state dicts
-    state_dict = dist_checkpointing.load(sharded_state_dict, ckpt_dir, sharded_strategy=load_strategy)
+    state_dict = dist_checkpointing.load(
+        sharded_state_dict,
+        ckpt_dir,
+        sharded_strategy=load_strategy,
+        validate_access_integrity=False
+    )
 
     return state_dict

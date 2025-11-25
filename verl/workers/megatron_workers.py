@@ -19,6 +19,7 @@ import datetime
 import logging
 import os
 import time
+import types
 from typing import Any, Optional
 
 import psutil
@@ -405,9 +406,10 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         return actor_module, actor_optimizer, actor_optimizer_scheduler, self.hf_config, optim_config
 
-    def _build_rollout(self, trust_remote_code=False):
+    def _build_rollout(self, trust_remote_code=False, tokens_queue=None, requests_queue=None):
         from torch.distributed.device_mesh import init_device_mesh
-
+        self._current_global_ids = None
+        
         # 1. parse rollout and huggingface model config
         rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model, dataclass_type=HFModelConfig)
@@ -444,6 +446,72 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
             config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
         )
+        
+        def patch_step(self_):
+            if not self_.scheduler.has_requests():
+                return {}, False
+            scheduler_output = self_.scheduler.schedule()
+            model_output = self_.execute_model_with_error_logging(
+                self_.model_executor.execute_model, scheduler_output  # type: ignore
+            )
+            # try:
+            #     if torch.distributed.get_rank() == 4:
+            #         raise Exception("raise in the second vllm instance")
+            # except Exception as e:
+            #     print(f"exception:{e}")
+            engine_core_outputs = self_.scheduler.update_from_output(
+                scheduler_output, model_output
+            )  # type: ignore
+            if is_collect:
+                req_info = {}
+                finished_global_ids = []
+                if self._current_global_ids is not None:
+                    req_id_to_index_dict = model_output.req_id_to_index
+                    sampled_token_ids = model_output.sampled_token_ids
+                    # 构建以 global_req_id 为 key 的字典
+                    for req_id in model_output.req_ids:
+                        vllm_index = req_id_to_index_dict.get(req_id)
+                        if vllm_index is not None and vllm_index < len(self._current_global_ids):
+                            global_req_id = self._current_global_ids[vllm_index]
+                            # 获取对应 req_id 的 sampled_token_ids
+                            # sampled_token_ids 可能是列表、张量或其他可索引对象
+                            if isinstance(sampled_token_ids, (list, tuple)) and vllm_index < len(sampled_token_ids):
+                                token_ids = sampled_token_ids[vllm_index]
+                            elif hasattr(sampled_token_ids, '__getitem__') and hasattr(sampled_token_ids, '__len__'):
+                                if vllm_index < len(sampled_token_ids):
+                                    token_ids = sampled_token_ids[vllm_index]
+                                else:
+                                    token_ids = None
+                            else:
+                                token_ids = sampled_token_ids  # 如果只有一个值或无法索引
+                            req_info[global_req_id] = {
+                                "req_id": req_id,
+                                "sampled_token_ids": token_ids,
+                                "req_id_to_index": vllm_index
+                            }
+                    # 将 finished_req_ids 映射为 global_ids
+                    for finished_req_id in scheduler_output.finished_req_ids:
+                        finished_index = req_id_to_index_dict.get(finished_req_id)
+                        if finished_index is not None and finished_index < len(self._current_global_ids):
+                            finished_global_ids.append(self._current_global_ids[finished_index])
+                step_result = {
+                    # "global_rank_id": torch.distributed.get_rank(),
+                    "finished_global_ids": finished_global_ids,  # 已完成的请求的 global_id 列表
+                    "req_info": req_info
+                }
+                if tokens_queue is not None:
+                    tokens_queue.put(step_result)
+            return (
+                engine_core_outputs,
+                scheduler_output.total_num_scheduled_tokens > 0,
+
+            )
+        self.rollout.inference_engine.llm_engine.engine_core.engine_core.step = (
+            types.MethodType(
+                patch_step,
+                self.rollout.inference_engine.llm_engine.engine_core.engine_core,
+            )
+        )
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
 
         # 5. switch to trainer mode
@@ -455,7 +523,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             loop.run_until_complete(self.trainer_mode())
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def init_model(self):
+    def init_model(self, tokens_queue=None, requests_queue=None):
         if self.config.model.get("external_lib", None) is not None:
             # This is used to import external_lib into the huggingface systems
             import importlib
@@ -517,7 +585,11 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             log_gpu_memory_usage("After MegatronPPOActor init", logger=logger)
 
         if self._is_rollout:
-            self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
+            self._build_rollout(
+                trust_remote_code=self.config.model.get("trust_remote_code", False),
+                tokens_queue=tokens_queue,
+                requests_queue=requests_queue,
+            )
             log_gpu_memory_usage("After rollout init", logger=logger)
 
         if self._is_ref:
@@ -678,6 +750,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     def generate_sequences(self, prompts: DataProto):
         assert self._is_rollout
         prompts = prompts.to(get_device_name())
+        if "global_id" in prompts.non_tensor_batch:
+            self._current_global_ids = prompts.non_tensor_batch["global_id"]
         meta_info = {
             "eos_token_id": self.generation_config.eos_token_id
             if self.generation_config is not None
